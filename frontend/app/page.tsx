@@ -1256,6 +1256,19 @@ export default function Dashboard() {
 
       {showAddModal   && <AddServerModal      onClose={()=>setShowAddModal(false)}  onAdded={handleServerAdded}/>}
       {showChangePwd  && <ChangePasswordModal onClose={()=>setShowChangePwd(false)}/>}
+
+      {/* ── Footer ──────────────────────────────────── */}
+      <div style={{ height:28, background:'#13161e', borderTop:'1px solid #1a1e28', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+        <span style={{ fontSize:10, color:'#4e5668' }}>
+          Powered by{' '}
+          <a href="https://github.com/finedevsam" target="_blank" rel="noopener noreferrer"
+            style={{ color:'#4f7cff', textDecoration:'none', fontWeight:600 }}
+            onMouseOver={e=>e.currentTarget.style.textDecoration='underline'}
+            onMouseOut={e=>e.currentTarget.style.textDecoration='none'}>
+            finedevsam
+          </a>
+        </span>
+      </div>
     </div>
   );
 }
