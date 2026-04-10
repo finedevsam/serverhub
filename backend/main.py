@@ -16,7 +16,8 @@ import select
 import subprocess
 import tempfile
 import base64
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -42,11 +43,10 @@ JWT_EXPIRE_HOURS = 12
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-SERVERS_FILE     = "/data/servers.json"
-USERS_FILE       = "/data/users.json"
-PERMISSIONS_FILE = "/data/permissions.json"
-SSH_KEYS_DIR     = "/data/ssh_keys"
-WG_CONFIGS_DIR   = "/data/wg_configs"
+SERVERS_FILE   = "/data/servers.json"
+DB_FILE        = "/data/serverhub.db"
+SSH_KEYS_DIR   = "/data/ssh_keys"
+WG_CONFIGS_DIR = "/data/wg_configs"
 
 os.makedirs("/data", exist_ok=True)
 os.makedirs(SSH_KEYS_DIR, exist_ok=True)
@@ -131,45 +131,57 @@ def save_servers(servers: dict):
 def hash_password(password: str) -> str:
     return hashlib.sha256(f"serverhub-salt:{password}".encode()).hexdigest()
 
-def load_users() -> dict:
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    # Bootstrap the first admin from env vars on first run.
-    default: dict = {
-        ADMIN_USERNAME: {
-            "username": ADMIN_USERNAME,
-            "password_hash": hash_password(ADMIN_PASSWORD),
-            "role": "admin",
-            "created_at": datetime.utcnow().isoformat(),
-        }
-    }
-    save_users(default)
-    return default
+# ─────────────────────── SQLite DB ───────────────────────
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_users(users: dict):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+def init_db():
+    conn = get_db()
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                username    TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role        TEXT NOT NULL DEFAULT 'developer',
+                created_at  TEXT NOT NULL,
+                created_by  TEXT
+            );
+            CREATE TABLE IF NOT EXISTS permissions (
+                username  TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                PRIMARY KEY (username, server_id)
+            );
+        """)
+        # Bootstrap admin from env if table is empty
+        cur = conn.execute("SELECT COUNT(*) FROM users")
+        if cur.fetchone()[0] == 0:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (ADMIN_USERNAME, hash_password(ADMIN_PASSWORD), datetime.now(timezone.utc).isoformat()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
-def load_permissions() -> dict:
-    """Returns {username: [server_id, ...]}. Admins are not stored here — they always have full access."""
-    if os.path.exists(PERMISSIONS_FILE):
-        with open(PERMISSIONS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+init_db()
 
-def save_permissions(perms: dict):
-    with open(PERMISSIONS_FILE, "w") as f:
-        json.dump(perms, f, indent=2)
 
 def assert_server_access(server_id: str, username: str):
     """Raise 403 if a developer has not been granted access to this server."""
-    users = load_users()
-    if users.get(username, {}).get("role") == "admin":
-        return  # admins always have full access
-    perms = load_permissions()
-    if server_id not in perms.get(username, []):
-        raise HTTPException(status_code=403, detail="You do not have access to this server")
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if row and row["role"] == "admin":
+            return  # admins always have full access
+        exists = conn.execute(
+            "SELECT 1 FROM permissions WHERE username = ? AND server_id = ?", (username, server_id)
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=403, detail="You do not have access to this server")
+    finally:
+        conn.close()
 
 def get_key_path(server_id: str) -> str:
     return os.path.join(SSH_KEYS_DIR, f"{server_id}.pem")
@@ -181,8 +193,8 @@ def get_wg_path(server_id: str) -> str:
 def create_token(username: str) -> str:
     payload = {
         "sub": username,
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
-        "iat": datetime.utcnow(),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+        "iat": datetime.now(timezone.utc),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -196,9 +208,13 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def require_admin(username: str = Depends(verify_token)) -> str:
-    users = load_users()
-    if users.get(username, {}).get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row or row["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+    finally:
+        conn.close()
     return username
 
 # ─────────────────────── WireGuard helpers ───────────────────────
@@ -330,40 +346,55 @@ def check_server_status(server_data: dict) -> str:
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
-    users = load_users()
-    user_rec = users.get(req.username)
-    if not user_rec or user_rec["password_hash"] != hash_password(req.password):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT password_hash, role FROM users WHERE username = ?", (req.username,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or row["password_hash"] != hash_password(req.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(req.username)
-    return {"token": token, "username": req.username, "role": user_rec["role"], "expires_in": JWT_EXPIRE_HOURS * 3600}
+    return {"token": token, "username": req.username, "role": row["role"], "expires_in": JWT_EXPIRE_HOURS * 3600}
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
-    users = load_users()
-    role = users.get(user, {}).get("role", "developer")
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
+        role = row["role"] if row else "developer"
+    finally:
+        conn.close()
     return {"username": user, "role": role}
 
 @app.post("/api/auth/change-password")
 def change_password(req: ChangePasswordRequest, user: str = Depends(verify_token)):
-    users = load_users()
-    if user not in users:
-        raise HTTPException(status_code=404, detail="User not found")
-    if users[user]["password_hash"] != hash_password(req.current_password):
-        raise HTTPException(status_code=401, detail="Current password is incorrect")
     if len(req.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    users[user]["password_hash"] = hash_password(req.new_password)
-    save_users(users)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT password_hash FROM users WHERE username = ?", (user,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["password_hash"] != hash_password(req.current_password):
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
+        conn.execute("UPDATE users SET password_hash = ? WHERE username = ?",
+                     (hash_password(req.new_password), user))
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "Password changed successfully"}
 
 # ─── User management (admin only) ───
 @app.get("/api/users")
 def list_users(admin: str = Depends(require_admin)):
-    users = load_users()
-    return [
-        {"username": u["username"], "role": u["role"], "created_at": u.get("created_at", "")}
-        for u in users.values()
-    ]
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT username, role, created_at FROM users").fetchall()
+        return [{"username": r["username"], "role": r["role"], "created_at": r["created_at"] or ""} for r in rows]
+    finally:
+        conn.close()
 
 @app.post("/api/users")
 def create_user(req: UserCreate, admin: str = Depends(require_admin)):
@@ -371,83 +402,101 @@ def create_user(req: UserCreate, admin: str = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'developer'")
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    users = load_users()
-    if req.username in users:
-        raise HTTPException(status_code=409, detail="Username already exists")
-    users[req.username] = {
-        "username": req.username,
-        "password_hash": hash_password(req.password),
-        "role": req.role,
-        "created_at": datetime.utcnow().isoformat(),
-        "created_by": admin,
-    }
-    save_users(users)
-    return {"username": req.username, "role": req.role, "created_at": users[req.username]["created_at"]}
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        existing = conn.execute("SELECT 1 FROM users WHERE username = ?", (req.username,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already exists")
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+            (req.username, hash_password(req.password), req.role, created_at, admin),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"username": req.username, "role": req.role, "created_at": created_at}
 
 @app.delete("/api/users/{username}")
 def delete_user(username: str, admin: str = Depends(require_admin)):
     if username == admin:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
-    users = load_users()
-    if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
-    # Prevent deleting last admin
-    if users[username]["role"] == "admin":
-        admins = [u for u in users.values() if u["role"] == "admin"]
-        if len(admins) <= 1:
-            raise HTTPException(status_code=400, detail="Cannot delete the last admin account")
-    del users[username]
-    save_users(users)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "admin":
+            count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+            if count <= 1:
+                raise HTTPException(status_code=400, detail="Cannot delete the last admin account")
+        conn.execute("DELETE FROM permissions WHERE username = ?", (username,))
+        conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+    finally:
+        conn.close()
     return {"message": "User deleted"}
 
 @app.put("/api/users/{username}/role")
 def change_user_role(username: str, req: ChangeRoleRequest, admin: str = Depends(require_admin)):
     if req.role not in ("admin", "developer"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'developer'")
-    users = load_users()
-    if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
-    # Prevent demoting last admin
-    if users[username]["role"] == "admin" and req.role == "developer":
-        admins = [u for u in users.values() if u["role"] == "admin"]
-        if len(admins) <= 1:
-            raise HTTPException(status_code=400, detail="Cannot demote the last admin")
-    users[username]["role"] = req.role
-    save_users(users)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "admin" and req.role == "developer":
+            count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+            if count <= 1:
+                raise HTTPException(status_code=400, detail="Cannot demote the last admin")
+        conn.execute("UPDATE users SET role = ? WHERE username = ?", (req.role, username))
+        conn.commit()
+    finally:
+        conn.close()
     return {"username": username, "role": req.role}
 
 # ─── Dashboard aggregate stats ───
 @app.get("/api/dashboard/stats")
 def dashboard_stats(user: str = Depends(verify_token)):
     servers = load_servers()
-    users_data = load_users()
     online  = sum(1 for s in servers.values() if s.get("status") == "online")
     offline = sum(1 for s in servers.values() if s.get("status") == "offline")
     unknown = sum(1 for s in servers.values() if s.get("status") not in ("online", "offline"))
     tags: dict = {}
     for s in servers.values():
         t = s.get("tag", "server"); tags[t] = tags.get(t, 0) + 1
+    conn = get_db()
+    try:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+        dev_count   = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'developer'").fetchone()[0]
+    finally:
+        conn.close()
     return {
         "servers": {"total": len(servers), "online": online, "offline": offline, "unknown": unknown},
         "tags": tags,
-        "users": {
-            "total": len(users_data),
-            "admins": sum(1 for u in users_data.values() if u.get("role") == "admin"),
-            "developers": sum(1 for u in users_data.values() if u.get("role") == "developer"),
-        },
+        "users": {"total": total_users, "admins": admin_count, "developers": dev_count},
     }
 
 # ─── Servers ───
 @app.get("/api/servers")
 def list_servers(user: str = Depends(verify_token)):
     servers = load_servers()
-    users_data = load_users()
-    # Admins see everything; developers only see servers they've been granted access to.
-    if users_data.get(user, {}).get("role") == "admin":
-        visible = list(servers.values())
-    else:
-        allowed = set(load_permissions().get(user, []))
-        visible = [s for s in servers.values() if s["id"] in allowed]
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
+        role = row["role"] if row else "developer"
+        if role == "admin":
+            visible = list(servers.values())
+        else:
+            allowed_rows = conn.execute(
+                "SELECT server_id FROM permissions WHERE username = ?", (user,)
+            ).fetchall()
+            allowed = {r["server_id"] for r in allowed_rows}
+            visible = [s for s in servers.values() if s["id"] in allowed]
+    finally:
+        conn.close()
     return [{k: v for k, v in s.items() if k != "password"} for s in visible]
 
 @app.post("/api/servers")
@@ -464,7 +513,7 @@ def add_server(req: ServerCreate, user: str = Depends(require_admin)):
         "auth_type": req.auth_type,
         "tag": req.tag,
         "status": "unknown",
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     if req.auth_type == "password" and req.password:
@@ -726,34 +775,46 @@ def get_logs(server_id: str, service: str = "syslog", lines: int = 100, user: st
 # ─── Server access management (admin only) ───
 @app.get("/api/users/{username}/servers")
 def get_user_server_access(username: str, admin: str = Depends(require_admin)):
-    users = load_users()
-    if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
-    if users[username]["role"] == "admin":
-        # Admins always have full access — return all server IDs
-        return {"server_ids": list(load_servers().keys()), "full_access": True}
-    perms = load_permissions()
-    return {"server_ids": perms.get(username, []), "full_access": False}
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "admin":
+            return {"server_ids": list(load_servers().keys()), "full_access": True}
+        perms = conn.execute(
+            "SELECT server_id FROM permissions WHERE username = ?", (username,)
+        ).fetchall()
+        return {"server_ids": [r["server_id"] for r in perms], "full_access": False}
+    finally:
+        conn.close()
 
 @app.put("/api/users/{username}/servers")
 def set_user_server_access(username: str, req: ServerAccessRequest, admin: str = Depends(require_admin)):
-    users = load_users()
-    if username not in users:
-        raise HTTPException(status_code=404, detail="User not found")
-    if users[username]["role"] == "admin":
-        raise HTTPException(status_code=400, detail="Admins always have full access; no need to set permissions")
-    servers = load_servers()
-    invalid = [sid for sid in req.server_ids if sid not in servers]
-    if invalid:
-        raise HTTPException(status_code=404, detail=f"Server(s) not found: {', '.join(invalid)}")
-    perms = load_permissions()
-    perms[username] = req.server_ids
-    save_permissions(perms)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if row["role"] == "admin":
+            raise HTTPException(status_code=400, detail="Admins always have full access; no need to set permissions")
+        servers = load_servers()
+        invalid = [sid for sid in req.server_ids if sid not in servers]
+        if invalid:
+            raise HTTPException(status_code=404, detail=f"Server(s) not found: {', '.join(invalid)}")
+        conn.execute("DELETE FROM permissions WHERE username = ?", (username,))
+        conn.executemany(
+            "INSERT INTO permissions (username, server_id) VALUES (?, ?)",
+            [(username, sid) for sid in req.server_ids],
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"username": username, "server_ids": req.server_ids}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 # ─── WebSocket PTY Terminal ───
 @app.websocket("/ws/servers/{server_id}/terminal")
@@ -772,12 +833,19 @@ async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(.
 
     # Check access for non-admin users
     username = payload["sub"]
-    users_data = load_users()
-    if users_data.get(username, {}).get("role") != "admin":
-        perms = load_permissions()
-        if server_id not in perms.get(username, []):
-            await websocket.close(code=4003)
-            return
+    conn = get_db()
+    try:
+        u_row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+        if not u_row or u_row["role"] != "admin":
+            p_row = conn.execute(
+                "SELECT 1 FROM permissions WHERE username = ? AND server_id = ?", (username, server_id)
+            ).fetchone()
+            if not p_row:
+                await websocket.close(code=4003)
+                conn.close()
+                return
+    finally:
+        conn.close()
 
     await websocket.accept()
 
