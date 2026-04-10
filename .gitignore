@@ -1,0 +1,21 @@
+# Environment
+.env
+*.env.local
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Docker volumes / data
+data/
+
+# SSH keys (never commit these)
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# OS
+.DS_Store
+Thumbs.db
