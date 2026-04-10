@@ -1,14 +1,14 @@
 'use client';
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { servers as serverApi, auth } from '@/lib/api';
+import { servers as serverApi, auth, userMgmt, dashboardStats } from '@/lib/api';
 import dynamic from 'next/dynamic';
 
 const TerminalTab = dynamic(() => import('./TerminalTab'), { ssr: false, loading: () => (
   <div style={{ flex:1, background:'#080a0e', display:'flex', alignItems:'center', justifyContent:'center', color:'#4e5668', fontFamily:"'JetBrains Mono',monospace", fontSize:12 }}>Initialising terminal…</div>
 ) });
 
-interface Server { id: string; name: string; ip: string; port: number; username: string; auth_type: string; tag: string; status: string; }
+interface Server { id: string; name: string; ip: string; port: number; username: string; auth_type: string; tag: string; status: string; use_wireguard?: boolean; }
 interface Metrics { cpu: number; mem_pct: number; mem_used_mb: number; mem_total_mb: number; disk_pct: number; disk_used_gb: number; disk_total_gb: number; uptime: string; net_rx_mb: number; net_tx_mb: number; }
 const TABS = ['Overview', 'Terminal', 'Docker', 'Services', 'Files', 'Logs'] as const;
 type Tab = typeof TABS[number];
@@ -20,6 +20,57 @@ const Input = (props: any) => <input {...props} style={{ ...inputStyle, ...props
 const Btn = ({ onClick, loading, children }: { onClick:()=>void; loading?:boolean; children:React.ReactNode }) => (
   <button onClick={onClick} disabled={loading} style={{ background:'#1a1e28', border:'1px solid #2a2f3f', color:'#8892a4', borderRadius:5, padding:'3px 9px', fontSize:10, cursor:'pointer', fontFamily:'inherit', opacity:loading?0.5:1 }}>{children}</button>
 );
+// ─── SVG Charts ──────────────────────────────────────────────────────
+function DonutChart({ data, size = 140 }: { data: {label:string; value:number; color:string}[]; size?: number }) {
+  const total = data.reduce((s,d) => s+d.value, 0);
+  const cx = size/2, cy = size/2, r = size/2-10, ir = r*0.62;
+  const gap = total > 1 ? 0.04 : 0;
+  const toXY = (angle: number, rad: number) => ({
+    x: cx + rad * Math.cos(angle - Math.PI/2),
+    y: cy + rad * Math.sin(angle - Math.PI/2),
+  });
+  if (total === 0) return (
+    <svg width={size} height={size}>
+      <circle cx={cx} cy={cy} r={(r+ir)/2} fill="none" stroke="#1a1e28" strokeWidth={r-ir}/>
+      <text x={cx} y={cy} textAnchor="middle" dominantBaseline="middle" fill="#4e5668" fontSize={size*0.12} fontFamily="'Sora',sans-serif">0</text>
+    </svg>
+  );
+  let cum = 0;
+  const paths = data.map(d => {
+    const sweep = (d.value/total)*Math.PI*2;
+    const s = cum+gap/2, e = cum+sweep-gap/2;
+    cum += sweep;
+    if (sweep <= gap) return null;
+    const lg = sweep > Math.PI ? 1 : 0;
+    const A = toXY(s,r), B = toXY(e,r), C = toXY(e,ir), D = toXY(s,ir);
+    return { d: `M${A.x},${A.y} A${r},${r} 0 ${lg} 1 ${B.x},${B.y} L${C.x},${C.y} A${ir},${ir} 0 ${lg} 0 ${D.x},${D.y} Z`, color: d.color };
+  });
+  return (
+    <svg width={size} height={size}>
+      {paths.map((p,i) => p && <path key={i} d={p.d} fill={p.color}/>)}
+      <text x={cx} y={cy-size*0.04} textAnchor="middle" dominantBaseline="middle" fill="#e2e6f0" fontSize={size*0.19} fontWeight="700" fontFamily="'Sora',sans-serif">{total}</text>
+      <text x={cx} y={cy+size*0.13} textAnchor="middle" dominantBaseline="middle" fill="#4e5668" fontSize={size*0.09} fontFamily="'Sora',sans-serif">total</text>
+    </svg>
+  );
+}
+
+function BarChart({ data }: { data: {label:string; value:number; color:string}[] }) {
+  const max = Math.max(...data.map(d=>d.value), 1);
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:10, width:'100%' }}>
+      {data.map((d,i) => (
+        <div key={i} style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ fontSize:11, color:'#8892a4', width:72, flexShrink:0, textAlign:'right' as const, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{d.label}</div>
+          <div style={{ flex:1, height:8, background:'#1a1e28', borderRadius:4, overflow:'hidden' }}>
+            <div style={{ height:'100%', width:`${(d.value/max)*100}%`, background:d.color, borderRadius:4, transition:'width 0.8s ease', minWidth:d.value>0?4:0 }}/>
+          </div>
+          <div style={{ fontSize:11, fontWeight:600, color:d.color, width:18, textAlign:'right' as const }}>{d.value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const MetricBar = ({ pct, color }: { pct: number; color: string }) => (
   <div style={{ height:3, background:'#1a1e28', borderRadius:2, marginTop:8, overflow:'hidden' }}>
     <div style={{ height:'100%', width:`${Math.min(pct,100)}%`, background:color, borderRadius:2, transition:'width 0.8s ease' }} />
@@ -111,6 +162,202 @@ function AddServerModal({ onClose, onAdded }: { onClose:()=>void; onAdded:(s:Ser
             <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>{loading?'Connecting…':'Add server'}</button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+function ChangePasswordModal({ onClose }: { onClose:()=>void }) {
+  const [form, setForm] = useState({ current:'', next:'', confirm:'' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [ok, setOk] = useState(false);
+  const set = (k: string) => (e: any) => setForm(f=>({...f,[k]:e.target.value}));
+  const submit = async (ev: React.FormEvent<HTMLFormElement>) => {
+    ev.preventDefault(); setError('');
+    if (form.next !== form.confirm) { setError('Passwords do not match'); return; }
+    if (form.next.length < 6)       { setError('New password must be at least 6 characters'); return; }
+    setLoading(true);
+    try { await auth.changePassword(form.current, form.next); setOk(true); }
+    catch (e: any) { setError(e.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  };
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:300 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:380 }}>
+        <div style={{ padding:'14px 18px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center' }}>
+          <span style={{ fontWeight:600, fontSize:14, flex:1 }}>Change password</span>
+          <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+        <div style={{ padding:20 }}>
+          {ok ? (
+            <div style={{ textAlign:'center' as const, padding:'10px 0 6px' }}>
+              <div style={{ fontSize:36, marginBottom:8 }}>✓</div>
+              <div style={{ color:'#22c55e', fontWeight:600, marginBottom:4, fontSize:13 }}>Password updated</div>
+              <div style={{ color:'#4e5668', fontSize:11, marginBottom:16 }}>Use your new password on next sign-in.</div>
+              <button onClick={onClose} style={btnPrimary}>Close</button>
+            </div>
+          ) : (
+            <form onSubmit={submit}>
+              <div style={{ marginBottom:12 }}><Label>Current password</Label><Input value={form.current} onChange={set('current')} type="password" required /></div>
+              <div style={{ marginBottom:12 }}><Label>New password</Label><Input value={form.next} onChange={set('next')} type="password" placeholder="min. 6 characters" required /></div>
+              <div style={{ marginBottom:16 }}><Label>Confirm new password</Label><Input value={form.confirm} onChange={set('confirm')} type="password" required /></div>
+              {error && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'7px 12px', color:'#ef4444', fontSize:12, marginBottom:12 }}>{error}</div>}
+              <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+                <button type="button" onClick={onClose} style={btnGhost}>Cancel</button>
+                <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>{loading?'Saving…':'Update password'}</button>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddUserModal({ onClose, onAdded }: { onClose:()=>void; onAdded:(u:any)=>void }) {
+  const [form, setForm] = useState({ username:'', password:'', role:'developer' });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const set = (k: string) => (e: any) => setForm(f=>({...f,[k]:e.target.value}));
+  const submit = async (ev: React.FormEvent<HTMLFormElement>) => {
+    ev.preventDefault(); setError(''); setLoading(true);
+    try { const r = await userMgmt.add(form); onAdded(r.data); }
+    catch (e: any) { setError(e.response?.data?.detail || 'Failed'); }
+    finally { setLoading(false); }
+  };
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:300 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:400 }}>
+        <div style={{ padding:'14px 18px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center' }}>
+          <span style={{ fontWeight:600, fontSize:14, flex:1 }}>Add team member</span>
+          <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+        <form onSubmit={submit} style={{ padding:20 }}>
+          <div style={{ marginBottom:12 }}><Label>Username</Label><Input value={form.username} onChange={set('username')} placeholder="john" required /></div>
+          <div style={{ marginBottom:12 }}><Label>Password</Label><Input value={form.password} onChange={set('password')} type="password" placeholder="min. 6 characters" required /></div>
+          <div style={{ marginBottom:16 }}>
+            <Label>Role</Label>
+            <div style={{ display:'flex', gap:6 }}>
+              {(['developer','admin'] as const).map(ro=>(
+                <button key={ro} type="button" onClick={()=>setForm(f=>({...f,role:ro}))}
+                  style={{ flex:1, padding:'8px', borderRadius:6, border:'1px solid', fontSize:11, cursor:'pointer', fontFamily:'inherit',
+                    borderColor:form.role===ro?'#4f7cff':'#2a2f3f', background:form.role===ro?'#0d1433':'#0d0f14', color:form.role===ro?'#4f7cff':'#8892a4' }}>
+                  <div style={{ fontWeight:600, marginBottom:2 }}>{ro==='admin'?'Admin':'Developer'}</div>
+                  <div style={{ fontSize:10, opacity:0.7 }}>{ro==='admin'?'Full access':'Connect & read'}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+          {error && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'7px 12px', color:'#ef4444', fontSize:12, marginBottom:12 }}>{error}</div>}
+          <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+            <button type="button" onClick={onClose} style={btnGhost}>Cancel</button>
+            <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>{loading?'Creating…':'Add member'}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function ManageAccessModal({ username, allServers, onClose }: { username:string; allServers:Server[]; onClose:(saved?:boolean)=>void }) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    userMgmt.getUserServers(username)
+      .then(r => setSelected(new Set(r.data.server_ids)))
+      .catch(() => setSelected(new Set()))
+      .finally(() => setLoading(false));
+  }, [username]);
+
+  const toggle = (id: string) => setSelected(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const save = async () => {
+    setSaving(true); setError('');
+    try {
+      await userMgmt.setUserServers(username, Array.from(selected));
+      onClose(true);
+    } catch (e: any) {
+      setError(e.response?.data?.detail || 'Failed to save');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const tagColors: Record<string,string> = { prod:'#ef4444', staging:'#f59e0b', api:'#06b6d4', db:'#a855f7', dev:'#22c55e', server:'#4f7cff' };
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:300 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:480, maxHeight:'80vh', display:'flex', flexDirection:'column' }}>
+        {/* Header */}
+        <div style={{ padding:'14px 18px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', flexShrink:0 }}>
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:600, fontSize:14, color:'#e2e6f0' }}>Server access</div>
+            <div style={{ fontSize:11, color:'#4e5668', marginTop:1 }}>
+              Choose which servers <span style={{ color:'#4f7cff' }}>{username}</span> can see and connect to
+            </div>
+          </div>
+          <button onClick={()=>onClose()} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+
+        {/* Select all / none bar */}
+        {!loading && allServers.length > 0 && (
+          <div style={{ padding:'8px 18px', borderBottom:'1px solid #1a1e28', display:'flex', alignItems:'center', gap:10, flexShrink:0, background:'#0d0f14' }}>
+            <span style={{ fontSize:11, color:'#4e5668', flex:1 }}>{selected.size} of {allServers.length} selected</span>
+            <button onClick={()=>setSelected(new Set(allServers.map(s=>s.id)))} style={{ ...btnGhost, padding:'2px 10px', fontSize:10 }}>All</button>
+            <button onClick={()=>setSelected(new Set())} style={{ ...btnGhost, padding:'2px 10px', fontSize:10 }}>None</button>
+          </div>
+        )}
+
+        {/* Server list */}
+        <div style={{ flex:1, overflowY:'auto', padding:'4px 0' }}>
+          {loading ? (
+            <div style={{ padding:24, textAlign:'center' as const, color:'#4e5668', fontSize:12 }}>Loading…</div>
+          ) : allServers.length === 0 ? (
+            <div style={{ padding:24, textAlign:'center' as const, color:'#4e5668', fontSize:12 }}>No servers added yet.</div>
+          ) : (
+            allServers.map(s => {
+              const checked = selected.has(s.id);
+              return (
+                <div key={s.id} onClick={()=>toggle(s.id)}
+                  style={{ display:'flex', alignItems:'center', gap:12, padding:'10px 18px', cursor:'pointer', borderBottom:'1px solid #1a1e28',
+                    background:checked?'#0d1117':'transparent' }}
+                  onMouseOver={e=>{ if(!checked) e.currentTarget.style.background='#0f1117'; }}
+                  onMouseOut={e=>{ e.currentTarget.style.background=checked?'#0d1117':'transparent'; }}>
+                  {/* Checkbox */}
+                  <div style={{ width:16, height:16, borderRadius:4, border:`2px solid ${checked?'#4f7cff':'#2a2f3f'}`, background:checked?'#4f7cff':'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, transition:'all 0.15s' }}>
+                    {checked && <svg width="9" height="7" viewBox="0 0 9 7" fill="none"><path d="M1 3.5L3.5 6L8 1" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                  </div>
+                  {/* Status dot */}
+                  <div style={{ width:7, height:7, borderRadius:'50%', background:s.status==='online'?'#22c55e':s.status==='offline'?'#ef4444':'#4e5668', flexShrink:0 }}/>
+                  {/* Info */}
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0' }}>{s.name}</div>
+                    <div style={{ fontSize:10, color:'#4e5668', fontFamily:"'JetBrains Mono',monospace" }}>{s.ip}:{s.port} · {s.username}</div>
+                  </div>
+                  {/* Tag */}
+                  <span style={{ fontSize:9, color:tagColors[s.tag]||'#4e5668', background:'#0d0f14', padding:'2px 7px', borderRadius:8, border:`1px solid ${tagColors[s.tag]||'#2a2f3f'}33`, flexShrink:0 }}>{s.tag}</span>
+                  {s.use_wireguard && <span style={{ fontSize:8, color:'#818cf8', flexShrink:0 }}>WG</span>}
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding:'12px 18px', borderTop:'1px solid #2a2f3f', display:'flex', alignItems:'center', gap:10, flexShrink:0 }}>
+          {error && <span style={{ fontSize:11, color:'#ef4444', flex:1 }}>{error}</span>}
+          {!error && <span style={{ fontSize:11, color:'#4e5668', flex:1 }}>{selected.size === 0 ? 'No access — member will see an empty server list' : `${selected.size} server${selected.size!==1?'s':''} will be accessible`}</span>}
+          <button onClick={()=>onClose()} style={btnGhost}>Cancel</button>
+          <button onClick={save} disabled={saving||loading} style={{ ...btnPrimary, opacity:saving?0.7:1 }}>{saving?'Saving…':'Save access'}</button>
+        </div>
       </div>
     </div>
   );
@@ -403,161 +650,612 @@ function LogsTab({ server }: { server: Server }) {
   );
 }
 
-export default function Dashboard() {
-  const router = useRouter();
-  const [user, setUser] = useState('');
-  const [serverList, setServerList] = useState<Server[]>([]);
-  const [activeServerId, setActiveServerId] = useState<string|null>(null);
+// ─── Per-server connection tab (owns all sub-tab state) ───────────────
+function ServerConnection({ server }: { server: Server }) {
   const [activeTab, setActiveTab] = useState<Tab>('Overview');
-  const [showAddModal, setShowAddModal] = useState(false);
   const [termEverShown, setTermEverShown] = useState(false);
   const termSendRef = useRef<((s: string) => void) | null>(null);
 
-  useEffect(()=>{
-    const token=localStorage.getItem('serverhub_token');
-    if(!token){router.push('/login');return;}
-    auth.me().then(r=>setUser(r.data.username)).catch(()=>{localStorage.removeItem('serverhub_token');router.push('/login');});
-    loadServers();
-  },[]);
-
-  // Reset terminal mount state when active server changes
-  useEffect(()=>{ setTermEverShown(false); termSendRef.current = null; },[activeServerId]);
-
-  const loadServers=async()=>{
-    try{const r=await serverApi.list();setServerList(r.data);if(r.data.length>0)setActiveServerId(r.data[0].id);}catch{}
-  };
-
-  const activeServer=serverList.find(s=>s.id===activeServerId);
-
-  const handleLogout=()=>{ localStorage.removeItem('serverhub_token'); router.push('/login'); };
-
-  const handleRunCmd=(cmd:string)=>{
+  const handleRunCmd = (cmd: string) => {
     setActiveTab('Terminal');
     setTermEverShown(true);
-    // Send to live terminal if already connected, else it will be picked up via initialCmd on first mount
-    if(termSendRef.current) { setTimeout(()=>termSendRef.current?.(cmd+'\n'), 100); }
+    if (termSendRef.current) setTimeout(() => termSendRef.current?.(cmd + '\n'), 100);
   };
 
-  const handleServerAdded=(s:Server)=>{ setServerList(p=>[...p,s]); setActiveServerId(s.id); };
+  const statusBg   = server.status==='online'?'#052e1a':server.status==='offline'?'#2e0505':'#1a1520';
+  const statusBdr  = server.status==='online'?'#0d4f2a':server.status==='offline'?'#4f0d0d':'#2a1e3f';
+  const statusClr  = server.status==='online'?'#22c55e':server.status==='offline'?'#ef4444':'#8892a4';
+  const statusTxt  = server.status==='online'?'● ONLINE':server.status==='offline'?'✕ OFFLINE':'? UNKNOWN';
 
-  const handleDeleteServer=async(id:string)=>{
-    if(!confirm('Remove this server?')) return;
-    try{await serverApi.delete(id);setServerList(p=>p.filter(s=>s.id!==id));if(activeServerId===id)setActiveServerId(serverList.find(s=>s.id!==id)?.id||null);}
-    catch(e:any){alert(e.response?.data?.detail||'Failed');}
+  return (
+    <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+      {/* Sub-tab bar */}
+      <div style={{ padding:'8px 20px', background:'#13161e', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', gap:12, flexShrink:0 }}>
+        <div>
+          <div style={{ fontSize:13, fontWeight:600, display:'flex', alignItems:'center', gap:8 }}>
+            {server.name}
+            <span style={{ fontSize:10, fontWeight:600, padding:'2px 8px', borderRadius:20, letterSpacing:'0.04em', background:statusBg, border:`1px solid ${statusBdr}`, color:statusClr }}>{statusTxt}</span>
+            {server.use_wireguard && <span style={{ fontSize:9, padding:'1px 6px', borderRadius:10, background:'#0d1433', border:'1px solid #1e2d66', color:'#818cf8' }}>WireGuard</span>}
+          </div>
+          <div style={{ color:'#4e5668', fontSize:10, display:'flex', gap:14, marginTop:2 }}>
+            <span>{server.ip}:{server.port}</span><span>{server.username}</span><span>{server.auth_type}</span>
+          </div>
+        </div>
+        <div style={{ flex:1 }}/>
+        <div style={{ display:'flex', gap:2, background:'#0d0f14', borderRadius:7, padding:3 }}>
+          {TABS.map(tab => (
+            <button key={tab} onClick={() => { setActiveTab(tab); if(tab==='Terminal') setTermEverShown(true); }}
+              style={{ padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11, fontWeight:500, border:'none', fontFamily:'inherit', transition:'all 0.15s',
+                background:tab===activeTab?'#13161e':'transparent', color:tab===activeTab?'#e2e6f0':'#4e5668' }}>
+              {tab}
+            </button>
+          ))}
+        </div>
+      </div>
+      {/* Sub-tab content */}
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        {activeTab==='Overview' && <OverviewTab server={server} onRunCmd={handleRunCmd}/>}
+        {(termEverShown || activeTab==='Terminal') && (
+          <div style={{ display:activeTab==='Terminal'?'flex':'none', flex:1, flexDirection:'column', overflow:'hidden' }}>
+            <TerminalTab key={server.id} server={server} isActive={activeTab==='Terminal'} onReady={fn => { termSendRef.current = fn; }}/>
+          </div>
+        )}
+        {activeTab==='Docker'   && <DockerTab   server={server}/>}
+        {activeTab==='Services' && <ServicesTab server={server}/>}
+        {activeTab==='Files'    && <FilesTab    server={server}/>}
+        {activeTab==='Logs'     && <LogsTab     server={server}/>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Home dashboard ────────────────────────────────────────────────────
+function HomeDashboard({ servers, onOpen, onAdd, isAdmin }: { servers: Server[]; onOpen:(s:Server)=>void; onAdd:()=>void; isAdmin:boolean }) {
+  const online  = servers.filter(s => s.status==='online').length;
+  const offline = servers.filter(s => s.status==='offline').length;
+  const unknown = servers.filter(s => s.status==='unknown').length;
+  const [apiStats, setApiStats] = useState<{users:{total:number;admins:number;developers:number}}|null>(null);
+
+  useEffect(()=>{
+    dashboardStats.get().then(r=>setApiStats(r.data)).catch(()=>{});
+  },[]);
+
+  const tagCounts = servers.reduce<Record<string,number>>((acc,s)=>{ acc[s.tag]=(acc[s.tag]||0)+1; return acc; },{});
+  const tagColors: Record<string,string> = { prod:'#ef4444', staging:'#f59e0b', api:'#06b6d4', db:'#a855f7', dev:'#22c55e', server:'#4f7cff' };
+
+  const statCards = [
+    { label:'Total servers', value:servers.length, color:'#4f7cff', bg:'#0d1433', bdr:'#1e2d66', sub:'registered' },
+    { label:'Online',        value:online,          color:'#22c55e', bg:'#052e1a', bdr:'#0d4f2a', sub:'reachable' },
+    { label:'Offline',       value:offline,         color:'#ef4444', bg:'#2e0505', bdr:'#4f0d0d', sub:'unreachable' },
+    { label:'Unknown',       value:unknown,         color:'#8892a4', bg:'#13161e', bdr:'#2a2f3f', sub:'not checked' },
+    { label:'Team members',  value:apiStats?.users.total ?? '—', color:'#a855f7', bg:'#1a0533', bdr:'#3b1566', sub:'users' },
+    { label:'Admins',        value:apiStats?.users.admins ?? '—', color:'#818cf8', bg:'#0d1433', bdr:'#1e2d66', sub:'full access' },
+  ];
+
+  const donutData = [
+    { label:'Online',  value:online,  color:'#22c55e' },
+    { label:'Offline', value:offline, color:'#ef4444' },
+    { label:'Unknown', value:unknown, color:'#4e5668' },
+  ];
+  const barData = Object.entries(tagCounts).map(([tag, count])=>({ label:tag, value:count, color:tagColors[tag]||'#8892a4' }));
+
+  return (
+    <div style={{ flex:1, overflowY:'auto', padding:'24px 28px' }}>
+      {/* Stat cards */}
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:12, marginBottom:20 }}>
+        {statCards.map(s => (
+          <div key={s.label} style={{ background:s.bg, border:`1px solid ${s.bdr}`, borderRadius:10, padding:'14px 16px' }}>
+            <div style={{ fontSize:9, fontWeight:600, color:s.color, textTransform:'uppercase' as const, letterSpacing:'0.08em', marginBottom:6 }}>{s.label}</div>
+            <div style={{ fontSize:30, fontWeight:700, color:s.color, letterSpacing:'-0.03em', lineHeight:1 }}>{s.value}</div>
+            <div style={{ fontSize:9, color:'#4e5668', marginTop:5 }}>{s.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Charts row */}
+      <div style={{ display:'grid', gridTemplateColumns:'280px 1fr 1fr', gap:14, marginBottom:20 }}>
+        {/* Status donut */}
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, padding:'16px 18px' }}>
+          <div style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em', marginBottom:14 }}>Status distribution</div>
+          <div style={{ display:'flex', alignItems:'center', gap:18 }}>
+            <DonutChart data={donutData} size={110}/>
+            <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+              {donutData.map(d=>(
+                <div key={d.label} style={{ display:'flex', alignItems:'center', gap:7 }}>
+                  <div style={{ width:8, height:8, borderRadius:'50%', background:d.color, flexShrink:0 }}/>
+                  <span style={{ fontSize:11, color:'#8892a4', flex:1 }}>{d.label}</span>
+                  <span style={{ fontSize:11, fontWeight:600, color:d.color }}>{d.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Tags bar */}
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, padding:'16px 18px' }}>
+          <div style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em', marginBottom:14 }}>Servers by tag</div>
+          {barData.length > 0
+            ? <BarChart data={barData}/>
+            : <div style={{ color:'#4e5668', fontSize:12, paddingTop:8 }}>No servers yet</div>}
+        </div>
+
+        {/* Team quick stats */}
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, padding:'16px 18px' }}>
+          <div style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em', marginBottom:14 }}>Team</div>
+          {apiStats ? (
+            <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+              {[
+                { label:'Total members', value:apiStats.users.total,      color:'#a855f7' },
+                { label:'Admins',        value:apiStats.users.admins,     color:'#818cf8' },
+                { label:'Developers',    value:apiStats.users.developers, color:'#22c55e' },
+              ].map(r=>(
+                <div key={r.label} style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'9px 12px', background:'#0d0f14', borderRadius:7 }}>
+                  <span style={{ fontSize:11, color:'#8892a4' }}>{r.label}</span>
+                  <span style={{ fontSize:16, fontWeight:700, color:r.color }}>{r.value}</span>
+                </div>
+              ))}
+              {isAdmin && (
+                <div style={{ fontSize:10, color:'#4f7cff', marginTop:4, cursor:'pointer' }}>Manage team in Team tab →</div>
+              )}
+            </div>
+          ) : (
+            <div style={{ color:'#4e5668', fontSize:12 }}>Loading…</div>
+          )}
+        </div>
+      </div>
+
+      {/* Server list + tags grid */}
+      <div style={{ display:'grid', gridTemplateColumns:'2fr 1fr', gap:14, marginBottom:20 }}>
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
+          <div style={{ padding:'12px 16px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+            <span style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>Recent servers</span>
+            {isAdmin && (
+              <button onClick={onAdd} style={{ ...btnPrimary, padding:'4px 12px', fontSize:11, display:'flex', alignItems:'center', gap:4 }}>
+                <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+                Add
+              </button>
+            )}
+          </div>
+          {servers.length === 0 ? (
+            <div style={{ padding:'28px 16px', textAlign:'center' as const, color:'#4e5668', fontSize:12 }}>
+              No servers yet.{isAdmin && <> <span style={{ color:'#4f7cff', cursor:'pointer' }} onClick={onAdd}>Add your first →</span></>}
+            </div>
+          ) : (
+            servers.slice(0,6).map(s=>(
+              <div key={s.id} onClick={()=>onOpen(s)} style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 16px', borderBottom:'1px solid #1a1e28', cursor:'pointer' }}
+                onMouseOver={e=>e.currentTarget.style.background='#161920'} onMouseOut={e=>e.currentTarget.style.background='transparent'}>
+                <StatusDot status={s.status}/>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0', whiteSpace:'nowrap' as const, overflow:'hidden', textOverflow:'ellipsis' }}>{s.name}</div>
+                  <div style={{ fontSize:10, color:'#4e5668', fontFamily:"'JetBrains Mono',monospace" }}>{s.ip}:{s.port}</div>
+                </div>
+                <span style={{ fontSize:9, color:tagColors[s.tag]||'#4e5668', background:'#0d0f14', padding:'2px 7px', borderRadius:10, border:`1px solid ${tagColors[s.tag]||'#2a2f3f'}22` }}>{s.tag}</span>
+                <span style={{ fontSize:10, color:'#4f7cff' }}>Connect →</span>
+              </div>
+            ))
+          )}
+        </div>
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
+          <div style={{ padding:'12px 16px', borderBottom:'1px solid #2a2f3f' }}>
+            <span style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>By tag</span>
+          </div>
+          <div style={{ padding:'12px 0' }}>
+            {Object.entries(tagCounts).map(([tag,count])=>(
+              <div key={tag} style={{ display:'flex', alignItems:'center', gap:10, padding:'7px 16px' }}>
+                <div style={{ width:8, height:8, borderRadius:'50%', background:tagColors[tag]||'#4e5668', flexShrink:0 }}/>
+                <span style={{ fontSize:12, color:'#e2e6f0', flex:1 }}>{tag}</span>
+                <span style={{ fontSize:12, fontWeight:600, color:tagColors[tag]||'#8892a4' }}>{count}</span>
+              </div>
+            ))}
+            {Object.keys(tagCounts).length===0 && <div style={{ padding:'16px', color:'#4e5668', fontSize:12 }}>No servers yet</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* All servers grid */}
+      {servers.length>0 && (
+        <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
+          <div style={{ padding:'12px 16px', borderBottom:'1px solid #2a2f3f' }}>
+            <span style={{ fontSize:11, fontWeight:600, color:'#8892a4', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>All servers</span>
+          </div>
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))', gap:1, background:'#2a2f3f' }}>
+            {servers.map(s=>(
+              <div key={s.id} onClick={()=>onOpen(s)} style={{ background:'#13161e', padding:'12px 16px', cursor:'pointer', display:'flex', alignItems:'center', gap:10 }}
+                onMouseOver={e=>e.currentTarget.style.background='#161920'} onMouseOut={e=>e.currentTarget.style.background='#13161e'}>
+                <div style={{ width:8, height:8, borderRadius:'50%', background:s.status==='online'?'#22c55e':s.status==='offline'?'#ef4444':'#4e5668', flexShrink:0 }}/>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{s.name}</div>
+                  <div style={{ fontSize:10, color:'#4e5668', fontFamily:"'JetBrains Mono',monospace" }}>{s.ip}</div>
+                </div>
+                {s.use_wireguard && <span style={{ fontSize:8, color:'#818cf8' }}>WG</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Servers table view ────────────────────────────────────────────────
+function ServersTable({ servers, onOpen, onDelete, onAdd, isAdmin }: { servers:Server[]; onOpen:(s:Server)=>void; onDelete:(id:string)=>void; onAdd:()=>void; isAdmin:boolean }) {
+  const cols = isAdmin ? '28px 1fr 160px 60px 80px 70px 80px 80px 110px' : '28px 1fr 160px 60px 80px 70px 80px 80px 70px';
+  return (
+    <div style={{ flex:1, overflowY:'auto', padding:'24px 28px' }}>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
+        <div>
+          <div style={{ fontSize:15, fontWeight:600, color:'#e2e6f0' }}>Server connections</div>
+          <div style={{ fontSize:11, color:'#4e5668', marginTop:2 }}>{servers.length} server{servers.length!==1?'s':''} · click a row to connect</div>
+        </div>
+        {isAdmin && (
+          <button onClick={onAdd} style={{ ...btnPrimary, display:'flex', alignItems:'center', gap:6 }}>
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+            Add server
+          </button>
+        )}
+      </div>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
+        <div style={{ display:'grid', gridTemplateColumns:cols, gap:0, padding:'8px 16px', borderBottom:'1px solid #2a2f3f', background:'#0d0f14' }}>
+          {['','Name','IP','Port','User','Auth','Tag','VPN',''].map((h,i) => (
+            <div key={i} style={{ fontSize:10, fontWeight:600, color:'#4e5668', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>{h}</div>
+          ))}
+        </div>
+        {servers.length === 0 && (
+          <div style={{ padding:'48px 16px', textAlign:'center' as const, color:'#4e5668', fontSize:12 }}>
+            {isAdmin
+              ? <><span>No servers yet. </span><span style={{ color:'#4f7cff', cursor:'pointer' }} onClick={onAdd}>Add your first server →</span></>
+              : <span>No servers have been shared with you yet. Ask an admin to grant you access.</span>}
+          </div>
+        )}
+        {servers.map((s, i) => (
+          <div key={s.id} onClick={() => onOpen(s)}
+            style={{ display:'grid', gridTemplateColumns:cols, gap:0, padding:'10px 16px',
+              borderBottom: i < servers.length-1 ? '1px solid #1a1e28' : 'none', cursor:'pointer', alignItems:'center' }}
+            onMouseOver={e=>e.currentTarget.style.background='#161920'} onMouseOut={e=>e.currentTarget.style.background='transparent'}>
+            <div><StatusDot status={s.status}/></div>
+            <div>
+              <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0' }}>{s.name}</div>
+              <div style={{ fontSize:10, color:'#4e5668', marginTop:1 }}>{s.status}</div>
+            </div>
+            <div style={{ fontSize:11, color:'#8892a4', fontFamily:"'JetBrains Mono',monospace", overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{s.ip}</div>
+            <div style={{ fontSize:11, color:'#4e5668', fontFamily:"'JetBrains Mono',monospace" }}>{s.port}</div>
+            <div style={{ fontSize:11, color:'#8892a4', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{s.username}</div>
+            <div style={{ fontSize:10, color:'#8892a4' }}>{s.auth_type}</div>
+            <div><span style={{ fontSize:9, color:'#4e5668', background:'#1a1e28', padding:'2px 7px', borderRadius:10, border:'1px solid #2a2f3f' }}>{s.tag}</span></div>
+            <div>{s.use_wireguard && <span style={{ fontSize:9, color:'#818cf8', background:'#0d1433', padding:'2px 7px', borderRadius:10, border:'1px solid #1e2d66' }}>WG</span>}</div>
+            <div style={{ display:'flex', gap:6, alignItems:'center' }} onClick={e=>e.stopPropagation()}>
+              <button onClick={() => onOpen(s)} style={{ ...btnPrimary, padding:'3px 10px', fontSize:10 }}>Connect</button>
+              {isAdmin && (
+                <button onClick={() => onDelete(s.id)}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:'#4e5668', borderRadius:5, padding:'3px 7px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
+                  onMouseOver={e=>{ e.currentTarget.style.borderColor='#4f0d0d'; e.currentTarget.style.color='#ef4444'; }}
+                  onMouseOut={e=>{ e.currentTarget.style.borderColor='#2a2f3f'; e.currentTarget.style.color='#4e5668'; }}>Delete</button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Team page ─────────────────────────────────────────────────────────
+// Small badge that lazily loads a developer's actual access count
+function ServerAccessBadge({ username, totalServers, refreshKey }: { username:string; totalServers:number; refreshKey:number }) {
+  const [count, setCount] = useState<number|null>(null);
+  useEffect(()=>{
+    setCount(null);
+    userMgmt.getUserServers(username).then(r=>setCount(r.data.server_ids.length)).catch(()=>setCount(0));
+  },[username, refreshKey]);
+  if (count === null) return <span style={{ fontSize:10, color:'#4e5668' }}>…</span>;
+  const none = count === 0;
+  return (
+    <span style={{ fontSize:10, fontWeight:600, padding:'2px 8px', borderRadius:6,
+      background:none?'#2e0505':count===totalServers?'#052e1a':'#1a1e28',
+      border:`1px solid ${none?'#4f0d0d':count===totalServers?'#0d4f2a':'#2a2f3f'}`,
+      color:none?'#ef4444':count===totalServers?'#22c55e':'#8892a4' }}>
+      {none ? 'No access' : `${count} / ${totalServers} server${totalServers!==1?'s':''}`}
+    </span>
+  );
+}
+
+function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; isAdmin:boolean; allServers:Server[] }) {
+  const [users, setUsers] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [managingAccess, setManagingAccess] = useState<string|null>(null);
+  const [accessRefreshKey, setAccessRefreshKey] = useState(0);
+
+  const load = useCallback(async () => {
+    try { const r = await userMgmt.list(); setUsers(r.data); }
+    catch {}
+    finally { setLoading(false); }
+  }, []);
+  useEffect(()=>{ load(); },[load]);
+
+  const handleDelete = async (username: string) => {
+    if (!confirm(`Remove "${username}" from the team?`)) return;
+    try { await userMgmt.delete(username); setUsers(p=>p.filter(u=>u.username!==username)); }
+    catch (e: any) { alert(e.response?.data?.detail||'Failed'); }
   };
+
+  const handleRoleChange = async (username: string, role: string) => {
+    try { await userMgmt.changeRole(username, role); setUsers(p=>p.map(u=>u.username===username?{...u,role}:u)); }
+    catch (e: any) { alert(e.response?.data?.detail||'Failed'); }
+  };
+
+  if (loading) return <div style={{ padding:24, color:'#4e5668', fontSize:12 }}>Loading…</div>;
+
+  const COLS = '1fr 160px 140px 140px 120px';
+
+  return (
+    <div style={{ flex:1, overflowY:'auto', padding:'24px 28px' }}>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
+        <div>
+          <div style={{ fontSize:15, fontWeight:600, color:'#e2e6f0' }}>Team</div>
+          <div style={{ fontSize:11, color:'#4e5668', marginTop:2 }}>{users.length} member{users.length!==1?'s':''} · manage roles and server access</div>
+        </div>
+        {isAdmin && (
+          <button onClick={()=>setShowAdd(true)} style={{ ...btnPrimary, display:'flex', alignItems:'center', gap:6 }}>
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+            Add member
+          </button>
+        )}
+      </div>
+
+      {/* Role legend */}
+      <div style={{ display:'flex', gap:10, marginBottom:16 }}>
+        {[{role:'admin',color:'#818cf8',bg:'#0d1433',bdr:'#1e2d66',desc:'Full access to all servers, users & settings'},
+          {role:'developer',color:'#22c55e',bg:'#052e1a',bdr:'#0d4f2a',desc:'Can only access servers explicitly granted by admin'}].map(r=>(
+          <div key={r.role} style={{ background:r.bg, border:`1px solid ${r.bdr}`, borderRadius:8, padding:'8px 14px', display:'flex', gap:10, alignItems:'center' }}>
+            <span style={{ fontSize:10, fontWeight:700, color:r.color, textTransform:'uppercase' as const, letterSpacing:'0.05em' }}>{r.role}</span>
+            <span style={{ fontSize:10, color:'#4e5668' }}>{r.desc}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
+        {/* Table header */}
+        <div style={{ display:'grid', gridTemplateColumns:COLS, padding:'8px 16px', borderBottom:'1px solid #2a2f3f', background:'#0d0f14' }}>
+          {['Member','Role','Server access','Added','Actions'].map((h,i)=>(
+            <div key={i} style={{ fontSize:10, fontWeight:600, color:'#4e5668', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>{h}</div>
+          ))}
+        </div>
+
+        {users.length === 0 && (
+          <div style={{ padding:'32px 16px', textAlign:'center' as const, color:'#4e5668', fontSize:12 }}>No team members yet.</div>
+        )}
+
+        {users.map((u, i)=>(
+          <div key={u.username} style={{ display:'grid', gridTemplateColumns:COLS, padding:'12px 16px', borderBottom:i<users.length-1?'1px solid #1a1e28':'none', alignItems:'center' }}>
+            {/* Member */}
+            <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+              <div style={{ width:30, height:30, borderRadius:'50%', background:'#1a1e28', border:'1px solid #2a2f3f', display:'flex', alignItems:'center', justifyContent:'center', fontSize:12, fontWeight:600, color:u.role==='admin'?'#818cf8':'#22c55e', flexShrink:0 }}>
+                {u.username[0].toUpperCase()}
+              </div>
+              <div>
+                <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0' }}>{u.username}</div>
+                {u.username===currentUser && <div style={{ fontSize:9, color:'#4f7cff', marginTop:1 }}>you</div>}
+              </div>
+            </div>
+
+            {/* Role */}
+            <div>
+              {isAdmin && u.username!==currentUser ? (
+                <select value={u.role} onChange={e=>handleRoleChange(u.username,e.target.value)}
+                  style={{ background:'#0d0f14', border:`1px solid ${u.role==='admin'?'#1e2d66':'#0d4f2a'}`, color:u.role==='admin'?'#818cf8':'#22c55e', borderRadius:6, padding:'4px 10px', fontSize:11, cursor:'pointer', fontFamily:'inherit', outline:'none' }}>
+                  <option value="admin">Admin</option>
+                  <option value="developer">Developer</option>
+                </select>
+              ) : (
+                <span style={{ fontSize:11, fontWeight:600, padding:'3px 10px', borderRadius:6, background:u.role==='admin'?'#0d1433':'#052e1a', border:`1px solid ${u.role==='admin'?'#1e2d66':'#0d4f2a'}`, color:u.role==='admin'?'#818cf8':'#22c55e' }}>{u.role}</span>
+              )}
+            </div>
+
+            {/* Server access summary */}
+            <div>
+              {u.role === 'admin' ? (
+                <span style={{ fontSize:10, color:'#818cf8', background:'#0d1433', border:'1px solid #1e2d66', borderRadius:6, padding:'2px 8px' }}>All servers</span>
+              ) : (
+                <ServerAccessBadge username={u.username} totalServers={allServers.length} refreshKey={accessRefreshKey} />
+              )}
+            </div>
+
+            {/* Added */}
+            <div style={{ fontSize:11, color:'#4e5668' }}>{u.created_at?new Date(u.created_at).toLocaleDateString():'—'}</div>
+
+            {/* Actions */}
+            <div style={{ display:'flex', gap:6 }}>
+              {isAdmin && u.role !== 'admin' && (
+                <button onClick={()=>setManagingAccess(u.username)}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:'#4f7cff', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
+                  onMouseOver={e=>{e.currentTarget.style.borderColor='#4f7cff';}}
+                  onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';}}>
+                  Access
+                </button>
+              )}
+              {isAdmin && u.username!==currentUser && (
+                <button onClick={()=>handleDelete(u.username)}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:'#4e5668', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
+                  onMouseOver={e=>{e.currentTarget.style.borderColor='#4f0d0d';e.currentTarget.style.color='#ef4444';}}
+                  onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';e.currentTarget.style.color='#4e5668';}}>
+                  Remove
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {showAdd && <AddUserModal onClose={()=>setShowAdd(false)} onAdded={u=>{setUsers(p=>[...p,u]);setShowAdd(false);}}/>}
+      {managingAccess && (
+        <ManageAccessModal
+          username={managingAccess}
+          allServers={allServers}
+          onClose={(saved)=>{ setManagingAccess(null); if(saved) setAccessRefreshKey(k=>k+1); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Main app ──────────────────────────────────────────────────────────
+export default function Dashboard() {
+  const router = useRouter();
+  const [user, setUser] = useState('');
+  const [role, setRole] = useState('developer');
+  const [serverList, setServerList] = useState<Server[]>([]);
+  const [activeTopTab, setActiveTopTab] = useState<'dashboard'|'servers'|'team'|string>('dashboard');
+  const [openConnections, setOpenConnections] = useState<string[]>([]);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showChangePwd, setShowChangePwd] = useState(false);
+
+  const isAdmin = role === 'admin';
+
+  useEffect(() => {
+    const token = localStorage.getItem('serverhub_token');
+    if (!token) { router.push('/login'); return; }
+    auth.me()
+      .then(r => { setUser(r.data.username); setRole(r.data.role ?? 'developer'); })
+      .catch(() => { localStorage.removeItem('serverhub_token'); router.push('/login'); });
+    loadServers();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const loadServers = async () => {
+    try { const r = await serverApi.list(); setServerList(r.data); } catch {}
+  };
+
+  const openConnection = (s: Server) => {
+    if (!openConnections.includes(s.id)) setOpenConnections(p => [...p, s.id]);
+    setActiveTopTab(s.id);
+  };
+
+  const closeConnection = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setOpenConnections(p => p.filter(x => x !== id));
+    if (activeTopTab === id) setActiveTopTab('servers');
+  };
+
+  const handleLogout = () => { localStorage.removeItem('serverhub_token'); router.push('/login'); };
+
+  const handleServerAdded = (s: Server) => {
+    setServerList(p => [...p, s]);
+    openConnection(s);
+  };
+
+  const handleDeleteServer = async (id: string) => {
+    if (!confirm('Remove this server?')) return;
+    try {
+      await serverApi.delete(id);
+      setServerList(p => p.filter(s => s.id !== id));
+      setOpenConnections(p => p.filter(x => x !== id));
+      if (activeTopTab === id) setActiveTopTab('servers');
+    } catch (e: any) { alert(e.response?.data?.detail || 'Failed'); }
+  };
+
+  const online = serverList.filter(s => s.status === 'online').length;
+
+  const navTab = (id: string, label: React.ReactNode) => (
+    <button key={id} onClick={() => setActiveTopTab(id)}
+      style={{ padding:'0 14px', background:'none', border:'none', borderBottom:`2px solid ${activeTopTab===id?'#4f7cff':'transparent'}`,
+        color:activeTopTab===id?'#e2e6f0':'#4e5668', fontSize:12, fontWeight:500, cursor:'pointer', fontFamily:'inherit', transition:'color 0.15s', whiteSpace:'nowrap' as const }}>
+      {label}
+    </button>
+  );
 
   return (
     <div style={{ height:'100vh', display:'flex', flexDirection:'column', background:'#0d0f14', fontFamily:"'Sora',sans-serif", fontSize:13 }}>
       <style>{`@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Sora:wght@300;400;500;600&display=swap');`}</style>
-      {/* TOP BAR */}
-      <div style={{ height:44, background:'#13161e', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', padding:'0 16px', gap:12, flexShrink:0 }}>
-        <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+
+      {/* ── Top bar ─────────────────────────────────── */}
+      <div style={{ height:44, background:'#13161e', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'stretch', padding:'0 16px', gap:0, flexShrink:0 }}>
+        {/* Logo */}
+        <div style={{ display:'flex', alignItems:'center', gap:7, paddingRight:20, borderRight:'1px solid #2a2f3f', marginRight:2 }}>
           <div style={{ width:8, height:8, borderRadius:'50%', background:'#4f7cff' }}/>
           <span style={{ fontSize:14, fontWeight:600, color:'#e2e6f0', letterSpacing:'-0.02em' }}>ServerHub</span>
         </div>
-        <div style={{ fontSize:11, color:'#4e5668' }}>{serverList.filter(s=>s.status==='online').length} online · {serverList.length} total</div>
-        <div style={{ flex:1 }}/>
-        <div style={{ fontSize:11, color:'#4e5668', display:'flex', alignItems:'center', gap:6 }}>
-          <div style={{ width:6, height:6, borderRadius:'50%', background:'#22c55e' }}/>{user}
+
+        {/* Static nav tabs */}
+        {navTab('dashboard', 'Dashboard')}
+        {navTab('servers', <>Servers{serverList.length>0&&<span style={{ fontSize:9, color:'#4e5668', background:'#1a1e28', borderRadius:8, padding:'1px 5px', marginLeft:4 }}>{serverList.length}</span>}</>)}
+        {navTab('team', 'Team')}
+
+        {/* Separator */}
+        {openConnections.length > 0 && <div style={{ width:1, background:'#2a2f3f', margin:'8px 6px' }}/>}
+
+        {/* Open connection tabs */}
+        <div style={{ display:'flex', alignItems:'stretch', overflowX:'auto', flex:1 }}>
+          {openConnections.map(id => {
+            const s = serverList.find(x => x.id === id);
+            if (!s) return null;
+            const isActive = activeTopTab === id;
+            return (
+              <button key={id} onClick={() => setActiveTopTab(id)}
+                style={{ display:'flex', alignItems:'center', gap:6, padding:'0 12px', background:isActive?'#1a1e28':'none', border:'none',
+                  borderBottom:`2px solid ${isActive?'#4f7cff':'transparent'}`, color:isActive?'#e2e6f0':'#8892a4',
+                  fontSize:11, cursor:'pointer', fontFamily:'inherit', whiteSpace:'nowrap' as const, flexShrink:0, transition:'all 0.15s' }}>
+                <div style={{ width:5, height:5, borderRadius:'50%', background:s.status==='online'?'#22c55e':s.status==='offline'?'#ef4444':'#4e5668', flexShrink:0 }}/>
+                {s.name}
+                <span onClick={e => closeConnection(id, e)}
+                  style={{ marginLeft:2, color:'#4e5668', fontSize:14, lineHeight:1, padding:'0 2px', borderRadius:3 }}
+                  onMouseOver={e=>e.currentTarget.style.color='#ef4444'} onMouseOut={e=>e.currentTarget.style.color='#4e5668'}>×</span>
+              </button>
+            );
+          })}
         </div>
-        <button onClick={handleLogout} style={{ ...btnGhost, padding:'4px 12px', fontSize:11 }}>Sign out</button>
-        <button onClick={()=>setShowAddModal(true)} style={{ ...btnPrimary, padding:'5px 14px', fontSize:12, display:'flex', alignItems:'center', gap:5 }}>
-          <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-          Add server
-        </button>
-      </div>
-      <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
-        {/* SIDEBAR */}
-        <div style={{ width:220, background:'#13161e', borderRight:'1px solid #2a2f3f', display:'flex', flexDirection:'column', flexShrink:0, overflowY:'auto' }}>
-          <div style={{ padding:'12px 12px 4px', fontSize:10, fontWeight:600, color:'#2a2f3f', letterSpacing:'0.08em', textTransform:'uppercase' as const }}>Servers</div>
-          {serverList.length===0&&(
-            <div style={{ padding:'16px 14px', fontSize:12, color:'#4e5668', textAlign:'center' as const, lineHeight:1.6 }}>
-              No servers yet.<br/>
-              <span style={{ color:'#4f7cff', cursor:'pointer' }} onClick={()=>setShowAddModal(true)}>Add your first server →</span>
+
+        {/* Right side */}
+        <div style={{ display:'flex', alignItems:'center', gap:8, paddingLeft:12, borderLeft:'1px solid #2a2f3f', flexShrink:0 }}>
+          <div style={{ fontSize:11, color:'#4e5668', display:'flex', alignItems:'center', gap:5 }}>
+            <div style={{ width:5, height:5, borderRadius:'50%', background:'#22c55e' }}/>{online}/{serverList.length}
+          </div>
+          {/* User badge */}
+          <div style={{ display:'flex', alignItems:'center', gap:6, background:'#0d0f14', border:'1px solid #2a2f3f', borderRadius:7, padding:'4px 10px' }}>
+            <div style={{ width:18, height:18, borderRadius:'50%', background:isAdmin?'#0d1433':'#052e1a', border:`1px solid ${isAdmin?'#1e2d66':'#0d4f2a'}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:9, fontWeight:700, color:isAdmin?'#818cf8':'#22c55e' }}>
+              {user[0]?.toUpperCase()}
             </div>
+            <span style={{ fontSize:11, color:'#e2e6f0' }}>{user}</span>
+            <span style={{ fontSize:9, fontWeight:600, color:isAdmin?'#818cf8':'#22c55e', background:isAdmin?'#0d1433':'#052e1a', padding:'1px 5px', borderRadius:4 }}>{role}</span>
+          </div>
+          <button onClick={()=>setShowChangePwd(true)} title="Change password"
+            style={{ background:'#1a1e28', border:'1px solid #2a2f3f', color:'#8892a4', borderRadius:6, padding:'5px 8px', cursor:'pointer', fontSize:12 }}
+            onMouseOver={e=>e.currentTarget.style.borderColor='#4f7cff'} onMouseOut={e=>e.currentTarget.style.borderColor='#2a2f3f'}>⚙</button>
+          <button onClick={handleLogout} style={{ ...btnGhost, padding:'4px 10px', fontSize:11 }}>Sign out</button>
+          {isAdmin && (
+            <button onClick={() => setShowAddModal(true)} style={{ ...btnPrimary, padding:'5px 12px', fontSize:11, display:'flex', alignItems:'center', gap:4 }}>
+              <svg width="9" height="9" viewBox="0 0 12 12" fill="none"><path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
+              Add server
+            </button>
           )}
-          {serverList.map(s=>(
-            <div key={s.id} onClick={()=>setActiveServerId(s.id)}
-              style={{ display:'flex', alignItems:'center', gap:9, padding:'8px 12px', cursor:'pointer', position:'relative', background:s.id===activeServerId?'#1a1e28':'transparent', transition:'background 0.15s' }}
-              onMouseOver={e=>{if(s.id!==activeServerId)e.currentTarget.style.background='#161920';}} onMouseOut={e=>{if(s.id!==activeServerId)e.currentTarget.style.background='transparent';}}>
-              {s.id===activeServerId&&<div style={{ position:'absolute', left:0, top:4, bottom:4, width:2, background:'#4f7cff', borderRadius:'0 2px 2px 0' }}/>}
-              <StatusDot status={s.status}/>
-              <div style={{ flex:1, minWidth:0 }}>
-                <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' as const }}>{s.name}</div>
-                <div style={{ fontSize:10, color:'#4e5668' }}>{s.ip}</div>
-              </div>
-              <div style={{ display:'flex', alignItems:'center', gap:4 }}>
-                <span style={{ fontSize:9, color:'#4e5668', background:'#1a1e28', padding:'1px 5px', borderRadius:3, border:'1px solid #2a2f3f' }}>{s.tag}</span>
-                <button onClick={e=>{e.stopPropagation();handleDeleteServer(s.id);}}
-                  style={{ background:'none', border:'none', color:'#2a2f3f', cursor:'pointer', fontSize:13, lineHeight:1, padding:'0 2px' }}
-                  onMouseOver={e=>e.currentTarget.style.color='#ef4444'} onMouseOut={e=>e.currentTarget.style.color='#2a2f3f'}>✕</button>
-              </div>
-            </div>
-          ))}
         </div>
-        {/* MAIN */}
-        {activeServer?(
-          <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
-            <div style={{ padding:'12px 20px', background:'#13161e', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', gap:12, flexShrink:0 }}>
-              <div>
-                <div style={{ fontSize:15, fontWeight:600, display:'flex', alignItems:'center', gap:8 }}>
-                  {activeServer.name}
-                  <span style={{ fontSize:10, fontWeight:600, padding:'2px 8px', borderRadius:20, letterSpacing:'0.04em',
-                    background:activeServer.status==='online'?'#052e1a':activeServer.status==='offline'?'#2e0505':'#1a1520',
-                    border:`1px solid ${activeServer.status==='online'?'#0d4f2a':activeServer.status==='offline'?'#4f0d0d':'#2a1e3f'}`,
-                    color:activeServer.status==='online'?'#22c55e':activeServer.status==='offline'?'#ef4444':'#8892a4' }}>
-                    {activeServer.status==='online'?'● ONLINE':activeServer.status==='offline'?'✕ OFFLINE':'? UNKNOWN'}
-                  </span>
-                </div>
-                <div style={{ color:'#4e5668', fontSize:11, display:'flex', gap:16, marginTop:3 }}>
-                  <span>{activeServer.ip}:{activeServer.port}</span>
-                  <span>user: {activeServer.username}</span>
-                  <span>auth: {activeServer.auth_type}</span>
-                </div>
-              </div>
-              <div style={{ flex:1 }}/>
-              <div style={{ display:'flex', gap:2, background:'#0d0f14', borderRadius:7, padding:3 }}>
-                {TABS.map(tab=>(
-                  <button key={tab} onClick={()=>setActiveTab(tab)}
-                    style={{ padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11, fontWeight:500, border:'none', fontFamily:'inherit', transition:'all 0.15s',
-                      background:tab===activeTab?'#13161e':'transparent', color:tab===activeTab?'#e2e6f0':'#4e5668' }}>
-                    {tab}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
-              {activeTab==='Overview'&&<OverviewTab server={activeServer} onRunCmd={handleRunCmd}/>}
-              {/* Terminal is always mounted once first visited; hidden with CSS to preserve the SSH session */}
-              {(termEverShown||activeTab==='Terminal')&&(
-                <div style={{ display:activeTab==='Terminal'?'flex':'none', flex:1, flexDirection:'column', overflow:'hidden' }}
-                  ref={()=>{ if(activeTab==='Terminal') setTermEverShown(true); }}>
-                  <TerminalTab
-                    key={activeServer.id}
-                    server={activeServer}
-                    isActive={activeTab==='Terminal'}
-                    onReady={(fn)=>{ termSendRef.current=fn; }}
-                  />
-                </div>
-              )}
-              {activeTab==='Docker'&&<DockerTab server={activeServer}/>}
-              {activeTab==='Services'&&<ServicesTab server={activeServer}/>}
-              {activeTab==='Files'&&<FilesTab server={activeServer}/>}
-              {activeTab==='Logs'&&<LogsTab server={activeServer}/>}
-            </div>
-          </div>
-        ):(
-          <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', flexDirection:'column', gap:16, color:'#4e5668' }}>
-            <div style={{ width:48, height:48, borderRadius:12, background:'#13161e', border:'1px solid #2a2f3f', display:'flex', alignItems:'center', justifyContent:'center', fontSize:22 }}>🖥</div>
-            <div style={{ textAlign:'center' as const }}>
-              <div style={{ color:'#8892a4', fontWeight:500, marginBottom:4 }}>No server selected</div>
-              <div style={{ fontSize:12 }}>Add a server to get started</div>
-            </div>
-            <button onClick={()=>setShowAddModal(true)} style={btnPrimary}>Add your first server</button>
-          </div>
-        )}
       </div>
-      {showAddModal&&<AddServerModal onClose={()=>setShowAddModal(false)} onAdded={handleServerAdded}/>}
+
+      {/* ── Content ─────────────────────────────────── */}
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        {activeTopTab === 'dashboard' && (
+          <HomeDashboard servers={serverList} onOpen={openConnection} onAdd={()=>setShowAddModal(true)} isAdmin={isAdmin}/>
+        )}
+        {activeTopTab === 'servers' && (
+          <ServersTable servers={serverList} onOpen={openConnection} onDelete={handleDeleteServer} onAdd={()=>setShowAddModal(true)} isAdmin={isAdmin}/>
+        )}
+        {activeTopTab === 'team' && (
+          <TeamPage currentUser={user} isAdmin={isAdmin} allServers={serverList}/>
+        )}
+        {/* Connection tabs — all rendered but hidden when inactive to preserve SSH sessions */}
+        {openConnections.map(id => {
+          const s = serverList.find(x => x.id === id);
+          if (!s) return null;
+          return (
+            <div key={id} style={{ display:activeTopTab===id?'flex':'none', flex:1, flexDirection:'column', overflow:'hidden' }}>
+              <ServerConnection server={s}/>
+            </div>
+          );
+        })}
+      </div>
+
+      {showAddModal   && <AddServerModal      onClose={()=>setShowAddModal(false)}  onAdded={handleServerAdded}/>}
+      {showChangePwd  && <ChangePasswordModal onClose={()=>setShowChangePwd(false)}/>}
     </div>
   );
 }

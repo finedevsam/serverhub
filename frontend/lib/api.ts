@@ -29,6 +29,25 @@ export const auth = {
   login: (username: string, password: string) =>
     api.post('/api/auth/login', { username, password }),
   me: () => api.get('/api/auth/me'),
+  changePassword: (current_password: string, new_password: string) =>
+    api.post('/api/auth/change-password', { current_password, new_password }),
+};
+
+export const userMgmt = {
+  list: () => api.get('/api/users'),
+  add: (data: { username: string; password: string; role: string }) =>
+    api.post('/api/users', data),
+  delete: (username: string) => api.delete(`/api/users/${username}`),
+  changeRole: (username: string, role: string) =>
+    api.put(`/api/users/${username}/role`, { role }),
+  getUserServers: (username: string) =>
+    api.get(`/api/users/${username}/servers`),
+  setUserServers: (username: string, server_ids: string[]) =>
+    api.put(`/api/users/${username}/servers`, { server_ids }),
+};
+
+export const dashboardStats = {
+  get: () => api.get('/api/dashboard/stats'),
 };
 
 export const servers = {

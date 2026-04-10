@@ -42,9 +42,11 @@ JWT_EXPIRE_HOURS = 12
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-SERVERS_FILE = "/data/servers.json"
-SSH_KEYS_DIR = "/data/ssh_keys"
-WG_CONFIGS_DIR = "/data/wg_configs"
+SERVERS_FILE     = "/data/servers.json"
+USERS_FILE       = "/data/users.json"
+PERMISSIONS_FILE = "/data/permissions.json"
+SSH_KEYS_DIR     = "/data/ssh_keys"
+WG_CONFIGS_DIR   = "/data/wg_configs"
 
 os.makedirs("/data", exist_ok=True)
 os.makedirs(SSH_KEYS_DIR, exist_ok=True)
@@ -87,6 +89,21 @@ class ServerCreate(BaseModel):
     use_wireguard: bool = False
     wg_config: Optional[str] = None   # full [Interface]+[Peer] wg config block
 
+class ServerAccessRequest(BaseModel):
+    server_ids: List[str]
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "developer"   # "admin" | "developer"
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class ChangeRoleRequest(BaseModel):
+    role: str
+
 class CommandRequest(BaseModel):
     command: str
 
@@ -111,6 +128,49 @@ def save_servers(servers: dict):
     with open(SERVERS_FILE, "w") as f:
         json.dump(servers, f, indent=2)
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(f"serverhub-salt:{password}".encode()).hexdigest()
+
+def load_users() -> dict:
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    # Bootstrap the first admin from env vars on first run.
+    default: dict = {
+        ADMIN_USERNAME: {
+            "username": ADMIN_USERNAME,
+            "password_hash": hash_password(ADMIN_PASSWORD),
+            "role": "admin",
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    }
+    save_users(default)
+    return default
+
+def save_users(users: dict):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=2)
+
+def load_permissions() -> dict:
+    """Returns {username: [server_id, ...]}. Admins are not stored here — they always have full access."""
+    if os.path.exists(PERMISSIONS_FILE):
+        with open(PERMISSIONS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_permissions(perms: dict):
+    with open(PERMISSIONS_FILE, "w") as f:
+        json.dump(perms, f, indent=2)
+
+def assert_server_access(server_id: str, username: str):
+    """Raise 403 if a developer has not been granted access to this server."""
+    users = load_users()
+    if users.get(username, {}).get("role") == "admin":
+        return  # admins always have full access
+    perms = load_permissions()
+    if server_id not in perms.get(username, []):
+        raise HTTPException(status_code=403, detail="You do not have access to this server")
+
 def get_key_path(server_id: str) -> str:
     return os.path.join(SSH_KEYS_DIR, f"{server_id}.pem")
 
@@ -134,6 +194,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+def require_admin(username: str = Depends(verify_token)) -> str:
+    users = load_users()
+    if users.get(username, {}).get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return username
 
 # ─────────────────────── WireGuard helpers ───────────────────────
 def wg_iface(server_id: str) -> str:
@@ -264,26 +330,128 @@ def check_server_status(server_data: dict) -> str:
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
-    if req.username != ADMIN_USERNAME or req.password != ADMIN_PASSWORD:
+    users = load_users()
+    user_rec = users.get(req.username)
+    if not user_rec or user_rec["password_hash"] != hash_password(req.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(req.username)
-    return {"token": token, "username": req.username, "expires_in": JWT_EXPIRE_HOURS * 3600}
+    return {"token": token, "username": req.username, "role": user_rec["role"], "expires_in": JWT_EXPIRE_HOURS * 3600}
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
-    return {"username": user}
+    users = load_users()
+    role = users.get(user, {}).get("role", "developer")
+    return {"username": user, "role": role}
+
+@app.post("/api/auth/change-password")
+def change_password(req: ChangePasswordRequest, user: str = Depends(verify_token)):
+    users = load_users()
+    if user not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if users[user]["password_hash"] != hash_password(req.current_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    users[user]["password_hash"] = hash_password(req.new_password)
+    save_users(users)
+    return {"message": "Password changed successfully"}
+
+# ─── User management (admin only) ───
+@app.get("/api/users")
+def list_users(admin: str = Depends(require_admin)):
+    users = load_users()
+    return [
+        {"username": u["username"], "role": u["role"], "created_at": u.get("created_at", "")}
+        for u in users.values()
+    ]
+
+@app.post("/api/users")
+def create_user(req: UserCreate, admin: str = Depends(require_admin)):
+    if req.role not in ("admin", "developer"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'developer'")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    users = load_users()
+    if req.username in users:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    users[req.username] = {
+        "username": req.username,
+        "password_hash": hash_password(req.password),
+        "role": req.role,
+        "created_at": datetime.utcnow().isoformat(),
+        "created_by": admin,
+    }
+    save_users(users)
+    return {"username": req.username, "role": req.role, "created_at": users[req.username]["created_at"]}
+
+@app.delete("/api/users/{username}")
+def delete_user(username: str, admin: str = Depends(require_admin)):
+    if username == admin:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Prevent deleting last admin
+    if users[username]["role"] == "admin":
+        admins = [u for u in users.values() if u["role"] == "admin"]
+        if len(admins) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot delete the last admin account")
+    del users[username]
+    save_users(users)
+    return {"message": "User deleted"}
+
+@app.put("/api/users/{username}/role")
+def change_user_role(username: str, req: ChangeRoleRequest, admin: str = Depends(require_admin)):
+    if req.role not in ("admin", "developer"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'developer'")
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Prevent demoting last admin
+    if users[username]["role"] == "admin" and req.role == "developer":
+        admins = [u for u in users.values() if u["role"] == "admin"]
+        if len(admins) <= 1:
+            raise HTTPException(status_code=400, detail="Cannot demote the last admin")
+    users[username]["role"] = req.role
+    save_users(users)
+    return {"username": username, "role": req.role}
+
+# ─── Dashboard aggregate stats ───
+@app.get("/api/dashboard/stats")
+def dashboard_stats(user: str = Depends(verify_token)):
+    servers = load_servers()
+    users_data = load_users()
+    online  = sum(1 for s in servers.values() if s.get("status") == "online")
+    offline = sum(1 for s in servers.values() if s.get("status") == "offline")
+    unknown = sum(1 for s in servers.values() if s.get("status") not in ("online", "offline"))
+    tags: dict = {}
+    for s in servers.values():
+        t = s.get("tag", "server"); tags[t] = tags.get(t, 0) + 1
+    return {
+        "servers": {"total": len(servers), "online": online, "offline": offline, "unknown": unknown},
+        "tags": tags,
+        "users": {
+            "total": len(users_data),
+            "admins": sum(1 for u in users_data.values() if u.get("role") == "admin"),
+            "developers": sum(1 for u in users_data.values() if u.get("role") == "developer"),
+        },
+    }
 
 # ─── Servers ───
 @app.get("/api/servers")
 def list_servers(user: str = Depends(verify_token)):
     servers = load_servers()
-    return [
-        {k: v for k, v in s.items() if k not in ("password",)}
-        for s in servers.values()
-    ]
+    users_data = load_users()
+    # Admins see everything; developers only see servers they've been granted access to.
+    if users_data.get(user, {}).get("role") == "admin":
+        visible = list(servers.values())
+    else:
+        allowed = set(load_permissions().get(user, []))
+        visible = [s for s in servers.values() if s["id"] in allowed]
+    return [{k: v for k, v in s.items() if k != "password"} for s in visible]
 
 @app.post("/api/servers")
-def add_server(req: ServerCreate, user: str = Depends(verify_token)):
+def add_server(req: ServerCreate, user: str = Depends(require_admin)):
     servers = load_servers()
     server_id = hashlib.md5(f"{req.ip}:{req.port}:{req.name}:{time.time()}".encode()).hexdigest()[:12]
 
@@ -324,7 +492,7 @@ def add_server(req: ServerCreate, user: str = Depends(verify_token)):
     return {k: v for k, v in servers[server_id].items() if k != "password"}
 
 @app.delete("/api/servers/{server_id}")
-def delete_server(server_id: str, user: str = Depends(verify_token)):
+def delete_server(server_id: str, user: str = Depends(require_admin)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -341,6 +509,7 @@ def server_status(server_id: str, user: str = Depends(verify_token)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     status = check_server_status(servers[server_id])
     servers[server_id]["status"] = status
     save_servers(servers)
@@ -352,6 +521,7 @@ def get_metrics(server_id: str, user: str = Depends(verify_token)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     s = servers[server_id]
 
     script = """
@@ -415,13 +585,11 @@ def exec_command(server_id: str, req: CommandRequest, user: str = Depends(verify
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
-
-    # Block dangerous commands
+    assert_server_access(server_id, user)
     blocked = ["rm -rf /", "mkfs", "dd if=/dev/zero", ":(){:|:&};:"]
     for b in blocked:
         if b in req.command:
             raise HTTPException(status_code=403, detail=f"Command blocked for safety: {b}")
-
     result = run_ssh_command(servers[server_id], req.command, timeout=30)
     return result
 
@@ -431,6 +599,7 @@ def get_services(server_id: str, user: str = Depends(verify_token)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     result = run_ssh_command(servers[server_id],
         "systemctl list-units --type=service --no-pager --no-legend --all | head -30", timeout=15)
     services = []
@@ -439,9 +608,7 @@ def get_services(server_id: str, user: str = Depends(verify_token)):
         if len(parts) >= 4:
             services.append({
                 "name": parts[0].replace(".service", ""),
-                "load": parts[1],
-                "active": parts[2],
-                "sub": parts[3],
+                "load": parts[1], "active": parts[2], "sub": parts[3],
                 "description": " ".join(parts[4:]) if len(parts) > 4 else ""
             })
     return services
@@ -453,6 +620,7 @@ def service_action(server_id: str, service: str, action: str, user: str = Depend
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     result = run_ssh_command(servers[server_id], f"sudo systemctl {action} {service}", timeout=15)
     return result
 
@@ -462,6 +630,7 @@ def get_docker(server_id: str, user: str = Depends(verify_token)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     result = run_ssh_command(servers[server_id],
         'docker ps -a --format \'{"id":"{{.ID}}","name":"{{.Names}}","image":"{{.Image}}","status":"{{.Status}}","ports":"{{.Ports}}","state":"{{.State}}"}\' 2>/dev/null || echo "[]"',
         timeout=15)
@@ -480,6 +649,7 @@ def docker_action(server_id: str, container: str, action: str, user: str = Depen
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     cmd = f"docker {action} {container}" if action != "logs" else f"docker logs --tail=50 {container}"
     result = run_ssh_command(servers[server_id], cmd, timeout=20)
     return result
@@ -490,8 +660,8 @@ def list_files(server_id: str, path: str = "/", user: str = Depends(verify_token
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
-    result = run_ssh_command(servers[server_id],
-        f"ls -la {path} 2>&1 | head -100", timeout=10)
+    assert_server_access(server_id, user)
+    result = run_ssh_command(servers[server_id], f"ls -la {path} 2>&1 | head -100", timeout=10)
     return {"path": path, "output": result["stdout"]}
 
 @app.get("/api/servers/{server_id}/file-content")
@@ -499,6 +669,7 @@ def read_file(server_id: str, path: str, user: str = Depends(verify_token)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     result = run_ssh_command(servers[server_id], f"cat {path} 2>&1 | head -500", timeout=10)
     return {"path": path, "content": result["stdout"]}
 
@@ -512,8 +683,8 @@ async def upload_file(
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     server_data = servers[server_id]
-
     data = await file.read()
     wg_active = False
     ssh_client = None
@@ -544,12 +715,41 @@ def get_logs(server_id: str, service: str = "syslog", lines: int = 100, user: st
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
+    assert_server_access(server_id, user)
     if service == "syslog":
         cmd = f"sudo journalctl -n {lines} --no-pager 2>/dev/null || sudo tail -n {lines} /var/log/syslog 2>/dev/null"
     else:
         cmd = f"sudo journalctl -u {service} -n {lines} --no-pager 2>/dev/null"
     result = run_ssh_command(servers[server_id], cmd, timeout=15)
     return {"logs": result["stdout"]}
+
+# ─── Server access management (admin only) ───
+@app.get("/api/users/{username}/servers")
+def get_user_server_access(username: str, admin: str = Depends(require_admin)):
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if users[username]["role"] == "admin":
+        # Admins always have full access — return all server IDs
+        return {"server_ids": list(load_servers().keys()), "full_access": True}
+    perms = load_permissions()
+    return {"server_ids": perms.get(username, []), "full_access": False}
+
+@app.put("/api/users/{username}/servers")
+def set_user_server_access(username: str, req: ServerAccessRequest, admin: str = Depends(require_admin)):
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if users[username]["role"] == "admin":
+        raise HTTPException(status_code=400, detail="Admins always have full access; no need to set permissions")
+    servers = load_servers()
+    invalid = [sid for sid in req.server_ids if sid not in servers]
+    if invalid:
+        raise HTTPException(status_code=404, detail=f"Server(s) not found: {', '.join(invalid)}")
+    perms = load_permissions()
+    perms[username] = req.server_ids
+    save_permissions(perms)
+    return {"username": username, "server_ids": req.server_ids}
 
 @app.get("/health")
 def health():
@@ -569,6 +769,15 @@ async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(.
     if server_id not in servers:
         await websocket.close(code=4004)
         return
+
+    # Check access for non-admin users
+    username = payload["sub"]
+    users_data = load_users()
+    if users_data.get(username, {}).get("role") != "admin":
+        perms = load_permissions()
+        if server_id not in perms.get(username, []):
+            await websocket.close(code=4003)
+            return
 
     await websocket.accept()
 
