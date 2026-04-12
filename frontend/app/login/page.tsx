@@ -141,8 +141,18 @@ export default function LoginPage() {
           </form>
         </div>
 
-        <p style={{ textAlign: 'center', marginTop: 20, color: '#2a2f3f', fontSize: 11 }}>
-          Default: admin / admin123 — change in .env
+        <p style={{ textAlign: 'center', marginTop: 20, color: '#4e5668', fontSize: 11 }}>
+          Set your credentials in <code style={{ color: '#4f7cff', fontFamily: "'JetBrains Mono', monospace" }}>.env</code> before first use —{' '}
+          <a
+            href="https://github.com/finedevsam/serverhub#quick-start"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#4f7cff', textDecoration: 'none' }}
+            onMouseOver={e => (e.currentTarget.style.textDecoration = 'underline')}
+            onMouseOut={e => (e.currentTarget.style.textDecoration = 'none')}
+          >
+            read the docs
+          </a>
         </p>
       </div>
     </div>

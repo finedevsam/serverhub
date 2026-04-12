@@ -4,6 +4,29 @@ A self-hosted developer operations portal. Manage unlimited servers from a singl
 
 ---
 
+## Table of contents
+
+1. [Features](#features)
+2. [Requirements](#requirements)
+3. [Before you start — set your credentials](#before-you-start--set-your-credentials)
+4. [Quick start](#quick-start)
+5. [Environment variables](#environment-variables)
+6. [Accessing from another machine](#accessing-from-another-machine)
+7. [Dashboard walkthrough](#dashboard-walkthrough)
+8. [Adding a server](#adding-a-server-admin-only)
+9. [Team management](#team-management-admin-only)
+10. [Changing your password](#changing-your-password)
+11. [File upload](#file-upload)
+12. [Architecture](#architecture)
+13. [Target server requirements](#target-server-requirements)
+14. [Security notes](#security-notes)
+15. [Stopping and starting](#stopping-and-starting)
+16. [Viewing container logs](#viewing-container-logs)
+17. [Project structure](#project-structure)
+18. [Troubleshooting](#troubleshooting)
+
+---
+
 ## Features
 
 | Category | What you get |
@@ -30,6 +53,46 @@ A self-hosted developer operations portal. Manage unlimited servers from a singl
 
 ---
 
+## Before you start — set your credentials
+
+> **This is the most important step.** ServerHub ships with a placeholder admin username and password defined in `.env.example`. You must set your own credentials before the first run. There are no hardcoded defaults — what you put in `.env` is what gets used.
+
+### Step 1 — copy the example env file
+
+```bash
+cp .env.example .env
+```
+
+### Step 2 — open `.env` and fill in every value
+
+```env
+# The username you will log in with
+ADMIN_USERNAME=admin
+
+# Your password — choose something strong
+ADMIN_PASSWORD=yourStrongPasswordHere
+
+# A secret key used to sign JWT tokens and encrypt stored credentials.
+# Generate one now: openssl rand -hex 32
+JWT_SECRET=paste-your-generated-secret-here
+```
+
+**Do not skip the JWT secret.** It is used to both sign login tokens and derive the encryption key for all stored SSH keys, passwords, and WireGuard configs. If you leave it as the placeholder, anyone who reads your `.env` file can decrypt your stored credentials.
+
+Generate a strong value right now:
+
+```bash
+openssl rand -hex 32
+```
+
+Paste the output into `JWT_SECRET` in your `.env` file.
+
+### Step 3 — never commit `.env`
+
+`.env` is listed in `.gitignore`. Keep it that way. Never push it to a repository.
+
+---
+
 ## Quick start
 
 ```bash
@@ -37,9 +100,9 @@ A self-hosted developer operations portal. Manage unlimited servers from a singl
 git clone <repo-url> serverhub
 cd serverhub
 
-# 2. Copy and edit the environment file
+# 2. Set your credentials (see "Before you start" above)
 cp .env.example .env
-# Edit .env — change ADMIN_PASSWORD and JWT_SECRET at minimum
+# Edit .env — set ADMIN_USERNAME, ADMIN_PASSWORD, and JWT_SECRET
 
 # 3. Start everything
 docker compose up --build -d
@@ -48,8 +111,7 @@ docker compose up --build -d
 open http://localhost:3000
 ```
 
-Default credentials: **admin / admin123**  
-Change these in `.env` before exposing to any network.
+Sign in with the `ADMIN_USERNAME` and `ADMIN_PASSWORD` you set in `.env`.
 
 ---
 
@@ -58,21 +120,31 @@ Change these in `.env` before exposing to any network.
 Edit `.env` before the first run:
 
 ```env
-# Required — change these
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123
-JWT_SECRET=change-me-use-openssl-rand-hex-32
+# ── Required — always change these ───────────────────────────────────────────
 
-# Required if accessing from another machine
+# Admin account username
+ADMIN_USERNAME=admin
+
+# Admin account password — use something strong, minimum 6 characters
+ADMIN_PASSWORD=yourStrongPasswordHere
+
+# JWT signing key AND credential encryption key.
+# Generate with: openssl rand -hex 32
+# WARNING: Changing this after first run will invalidate all stored encrypted
+# credentials. You will need to re-add your servers.
+JWT_SECRET=paste-your-generated-secret-here
+
+# ── Required only if accessing from another machine ───────────────────────────
+
+# Tell the browser where the backend API lives.
+# Replace with the IP or hostname of the machine running ServerHub.
 NEXT_PUBLIC_API_URL=http://YOUR_SERVER_IP:8000
 ```
 
-Generate a strong JWT secret:
-```bash
-openssl rand -hex 32
-```
+> **The admin account is created from these values on the very first startup.** If you change `ADMIN_USERNAME` or `ADMIN_PASSWORD` after the database already exists, the change will not take effect — you must either change the password through the UI (gear icon → Change password) or wipe the data volume and restart.
 
 After changing any variable, rebuild:
+
 ```bash
 docker compose down
 docker compose up --build -d
@@ -89,25 +161,13 @@ If ServerHub runs on a home server or VPS, tell the frontend where the API lives
 NEXT_PUBLIC_API_URL=http://YOUR_SERVER_IP:8000
 ```
 
-Then rebuild the frontend:
+Then rebuild:
+
 ```bash
 docker compose down && docker compose up --build -d
 ```
 
----
-
-## Stopping and starting
-
-```bash
-# Stop (keeps all data)
-docker compose down
-
-# Start again — no rebuild needed
-docker compose up -d
-
-# Wipe everything including stored servers and keys
-docker compose down -v
-```
+Only port `3000` needs to be reachable from your browser. Do not expose port `8000` directly.
 
 ---
 
@@ -115,7 +175,7 @@ docker compose down -v
 
 ### Login
 
-Navigate to `http://localhost:3000`. Sign in with your admin credentials.
+Navigate to `http://localhost:3000` (or your server's address). Sign in with the username and password you set in `.env`.
 
 ### Dashboard tab
 
@@ -172,6 +232,7 @@ Inside each connection:
 ### SSH key tips
 
 Paste the full private key contents:
+
 ```
 -----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAA...
@@ -179,12 +240,14 @@ b3BlbnNzaC1rZXktdjEAAAAA...
 ```
 
 Copy from your local machine:
+
 ```bash
 cat ~/.ssh/id_ed25519    # Ed25519 (recommended)
 cat ~/.ssh/id_rsa        # RSA
 ```
 
 The public key must be in `~/.ssh/authorized_keys` on the target server:
+
 ```bash
 # From your local machine
 ssh-copy-id -i ~/.ssh/id_ed25519.pub ubuntu@your-server-ip
@@ -199,6 +262,7 @@ All keys are **encrypted at rest** using Fernet (AES-128-CBC) derived from your 
 ### WireGuard tips
 
 Paste a standard `wg-quick` config block:
+
 ```ini
 [Interface]
 PrivateKey = <your-private-key>
@@ -211,17 +275,6 @@ AllowedIPs = 10.0.0.0/24
 ```
 
 ServerHub brings the tunnel up before each SSH connection and tears it down after. DNS lines are stripped automatically — they are not needed inside the container.
-
----
-
-## File upload
-
-In the **Files** sub-tab, upload a file to the current directory two ways:
-
-- **Click the ↑ Upload button** and pick a file
-- **Drag and drop** a file onto the file browser area
-
-Files are transferred over SFTP using the server's SSH credentials.
 
 ---
 
@@ -250,7 +303,7 @@ By default a new developer has no server access. To grant access:
 2. Find the developer's row — the **Server access** column shows how many servers they can currently access
 3. Click the **Access** button
 4. In the modal, check the servers you want to grant access to (use **All** / **None** for bulk select)
-5. Click **Save access** — the badge updates immediately, no page refresh needed
+5. Click **Save access** — the badge updates immediately
 
 Access changes take effect on the developer's next API call. If they are currently logged in, the next time they load the Servers tab they will see only their granted servers.
 
@@ -271,7 +324,55 @@ Click **Remove** on their row. Their access is revoked immediately.
 
 ## Changing your password
 
-Click the **⚙** gear icon in the top-right corner of the navigation bar. Enter your current password, then your new password twice. The change takes effect immediately — use the new password on next sign-in.
+Click the **⚙** gear icon in the top-right corner of the navigation bar. Enter your current password, then your new password twice. The change takes effect immediately.
+
+---
+
+## File upload
+
+In the **Files** sub-tab, upload a file to the current directory two ways:
+
+- **Click the ↑ Upload button** and pick a file
+- **Drag and drop** a file onto the file browser area
+
+Files are transferred over SFTP using the server's SSH credentials.
+
+---
+
+## Architecture
+
+```
+Browser (port 3000)
+    │
+    ▼
+┌───────────────────────┐
+│  Frontend (Next.js)   │  Static React app — all UI, xterm.js terminal
+│  port 3000            │
+└──────────┬────────────┘
+           │  HTTP API + WebSocket
+           ▼
+┌───────────────────────┐
+│  Backend (FastAPI)    │  JWT auth, SSH/SFTP orchestration, user management
+│  port 8000            │  Fernet encryption of stored credentials
+└──────────┬────────────┘
+           │  SSH / SFTP (paramiko)
+           │  WireGuard tunnel (wg-quick) when configured
+           ▼
+┌───────────────────────┐
+│  Your servers         │  Any SSH-accessible Linux server
+│  port 22              │
+└───────────────────────┘
+```
+
+Data is persisted in a named Docker volume (`serverhub_data`) mounted at `/data`:
+
+```
+/data/
+├── serverhub.db        # SQLite database — users, roles, server access grants
+├── servers.json        # Server registry (no plaintext credentials)
+├── ssh_keys/           # Fernet-encrypted private keys (one file per server)
+└── wg_configs/         # Fernet-encrypted WireGuard configs
+```
 
 ---
 
@@ -305,52 +406,29 @@ sudo usermod -aG docker ubuntu
 
 ---
 
-## Architecture
+## Security notes
 
-```
-Browser (port 3000)
-    │
-    ▼
-┌───────────────────────┐
-│  Frontend (Next.js)   │  Static React app — all UI, xterm.js terminal
-│  port 3000            │
-└──────────┬────────────┘
-           │  HTTP API + WebSocket
-           ▼
-┌───────────────────────┐
-│  Backend (FastAPI)    │  JWT auth, SSH/SFTP orchestration, user management
-│  port 8000            │  Fernet encryption of stored credentials
-└──────────┬────────────┘
-           │  SSH / SFTP (paramiko)
-           │  WireGuard tunnel (wg-quick) when configured
-           ▼
-┌───────────────────────┐
-│  Your servers         │  Any SSH-accessible Linux server
-│  port 22              │
-└───────────────────────┘
-```
-
-Data is persisted in a named Docker volume (`serverhub_data`) mounted at `/data`:
-
-```
-/data/
-├── servers.json        # Server registry (no plaintext credentials)
-├── users.json          # User accounts (bcrypt-style hashed passwords)
-├── permissions.json    # Per-user server access grants
-├── ssh_keys/           # Fernet-encrypted private keys (one file per server)
-└── wg_configs/         # Fernet-encrypted WireGuard configs
-```
+- **Set a strong password and JWT secret** before the first run — see [Before you start](#before-you-start--set-your-credentials)
+- **Never expose port 8000** to the public internet — only port 3000 is needed for browser access
+- Run ServerHub on a **private network or behind a VPN** — it can execute arbitrary commands on your servers via SSH
+- SSH keys and WireGuard configs are stored `chmod 600` inside the Docker volume, encrypted with Fernet
+- **Rotating `JWT_SECRET` will invalidate all stored encrypted credentials** — re-add servers after rotating
+- Users are stored in a SQLite database (`/data/serverhub.db`) inside the Docker volume — back it up along with `ssh_keys/` and `wg_configs/`
 
 ---
 
-## Security notes
+## Stopping and starting
 
-- **Change the default password** (`admin123`) before connecting any real servers
-- **Generate a strong JWT secret**: `openssl rand -hex 32` — this also derives the encryption key for stored credentials
-- Run ServerHub on a **private network or behind a VPN** — it can execute arbitrary commands on your servers via SSH
-- **Do not expose port 8000** to the public internet — only port 3000 is needed for browser access
-- SSH keys and WireGuard configs are stored `chmod 600` inside the Docker volume
-- Rotating `JWT_SECRET` will invalidate all stored encrypted credentials — re-add servers after rotating
+```bash
+# Stop (keeps all data)
+docker compose down
+
+# Start again — no rebuild needed
+docker compose up -d
+
+# Wipe everything including stored servers, keys, and user accounts
+docker compose down -v
+```
 
 ---
 
@@ -374,7 +452,7 @@ docker compose logs -f frontend
 ```
 serverhub/
 ├── docker-compose.yml        # Orchestrates frontend + backend
-├── .env.example              # Copy to .env and customise
+├── .env.example              # Copy to .env and fill in your values
 ├── .gitignore
 ├── README.md
 ├── backend/
@@ -398,6 +476,11 @@ serverhub/
 ---
 
 ## Troubleshooting
+
+**"Invalid credentials" on first login**
+- Make sure you set `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` before running `docker compose up --build`
+- If you already ran it with the wrong values, wipe the data volume and rebuild: `docker compose down -v && docker compose up --build -d`
+- The admin account is only bootstrapped once — on the very first startup when the database is empty
 
 **"Cannot connect to server"**
 - Verify the IP, port, and username are correct
@@ -432,3 +515,8 @@ serverhub/
 
 **"Admin access required" error**
 - The action requires an Admin role — Developers cannot add/delete servers or manage users
+
+**Password or JWT secret changed but old credentials stopped working**
+- `ADMIN_USERNAME`/`ADMIN_PASSWORD` in `.env` only apply on the very first run (database bootstrap)
+- After first run, use the Change Password UI (gear icon) to update your password
+- Changing `JWT_SECRET` invalidates all encrypted credentials — re-add your servers after rotating it
