@@ -3,8 +3,11 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { auth } from '@/lib/api';
 
+type Step = 'username' | 'password';
+
 export default function LoginPage() {
   const router = useRouter();
+  const [step, setStep] = useState<Step>('username');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -14,19 +17,38 @@ export default function LoginPage() {
     if (localStorage.getItem('serverhub_token')) router.push('/');
   }, []);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleUsernameSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!username.trim()) return;
+    setError('');
+    setStep('password');
+  };
+
+  const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
-      const res = await auth.login(username, password);
+      const res = await auth.login(username.trim(), password);
       localStorage.setItem('serverhub_token', res.data.token);
+      if (res.data.twofa_enabled) {
+        localStorage.setItem('serverhub_twofa_enabled', '1');
+      } else {
+        localStorage.removeItem('serverhub_twofa_enabled');
+      }
       router.push('/');
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Login failed');
+      setPassword('');
     } finally {
       setLoading(false);
     }
+  };
+
+  const resetToUsername = () => {
+    setStep('username');
+    setPassword('');
+    setError('');
   };
 
   return (
@@ -44,6 +66,7 @@ export default function LoginPage() {
         .inp { transition: border-color 0.2s, background 0.2s; }
         .login-btn:hover:not(:disabled) { background: #3a5fd6 !important; }
         .login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .back-btn:hover { color: #e2e6f0 !important; }
         .bg-grid {
           position: fixed; inset: 0; pointer-events: none;
           background-image: linear-gradient(rgba(79,124,255,0.03) 1px, transparent 1px),
@@ -82,63 +105,98 @@ export default function LoginPage() {
         <div style={{
           background: '#13161e', border: '1px solid #2a2f3f', borderRadius: 12, padding: '32px 28px'
         }}>
-          <h2 style={{ color: '#e2e6f0', fontSize: 16, fontWeight: 600, marginBottom: 6 }}>Sign in</h2>
-          <p style={{ color: '#4e5668', fontSize: 12, marginBottom: 24 }}>Enter your credentials to access the console</p>
+          {/* Step: username */}
+          {step === 'username' && (
+            <>
+              <h2 style={{ color: '#e2e6f0', fontSize: 16, fontWeight: 600, marginBottom: 6 }}>Sign in</h2>
+              <p style={{ color: '#4e5668', fontSize: 12, marginBottom: 24 }}>Enter your username to continue</p>
+              <form onSubmit={handleUsernameSubmit}>
+                <div style={{ marginBottom: 20 }}>
+                  <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#8892a4', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Username</label>
+                  <input
+                    className="inp"
+                    type="text"
+                    value={username}
+                    onChange={e => setUsername(e.target.value)}
+                    placeholder="your-username"
+                    autoFocus
+                    required
+                    style={{
+                      width: '100%', background: '#13161e', border: '1px solid #2a2f3f',
+                      borderRadius: 7, padding: '10px 12px', color: '#e2e6f0',
+                      fontSize: 13, fontFamily: "'Sora', sans-serif"
+                    }}
+                  />
+                </div>
+                <button
+                  className="login-btn"
+                  type="submit"
+                  style={{
+                    width: '100%', background: '#4f7cff', border: 'none', borderRadius: 7,
+                    padding: '11px', color: '#fff', fontSize: 13, fontWeight: 600,
+                    fontFamily: "'Sora', sans-serif", cursor: 'pointer', transition: 'background 0.2s'
+                  }}
+                >
+                  Continue →
+                </button>
+              </form>
+            </>
+          )}
 
-          <form onSubmit={handleLogin}>
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#8892a4', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Username</label>
-              <input
-                className="inp"
-                type="text"
-                value={username}
-                onChange={e => setUsername(e.target.value)}
-                placeholder="admin"
-                required
-                style={{
-                  width: '100%', background: '#13161e', border: '1px solid #2a2f3f',
-                  borderRadius: 7, padding: '10px 12px', color: '#e2e6f0',
-                  fontSize: 13, fontFamily: "'Sora', sans-serif"
-                }}
-              />
-            </div>
-            <div style={{ marginBottom: 20 }}>
-              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#8892a4', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Password</label>
-              <input
-                className="inp"
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder="••••••••"
-                required
-                style={{
-                  width: '100%', background: '#13161e', border: '1px solid #2a2f3f',
-                  borderRadius: 7, padding: '10px 12px', color: '#e2e6f0',
-                  fontSize: 13, fontFamily: "'Sora', sans-serif"
-                }}
-              />
-            </div>
-
-            {error && (
-              <div style={{
-                background: '#2e0505', border: '1px solid #4f0d0d', borderRadius: 7,
-                padding: '9px 12px', color: '#ef4444', fontSize: 12, marginBottom: 16
-              }}>{error}</div>
-            )}
-
-            <button
-              className="login-btn"
-              type="submit"
-              disabled={loading}
-              style={{
-                width: '100%', background: '#4f7cff', border: 'none', borderRadius: 7,
-                padding: '11px', color: '#fff', fontSize: 13, fontWeight: 600,
-                fontFamily: "'Sora', sans-serif", cursor: 'pointer', transition: 'background 0.2s'
-              }}
-            >
-              {loading ? 'Signing in…' : 'Sign in →'}
-            </button>
-          </form>
+          {/* Step: password */}
+          {step === 'password' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                <button
+                  className="back-btn"
+                  onClick={resetToUsername}
+                  style={{ background: 'none', border: 'none', color: '#4e5668', cursor: 'pointer', padding: 0, fontSize: 14, lineHeight: 1 }}
+                  title="Back"
+                >←</button>
+                <h2 style={{ color: '#e2e6f0', fontSize: 16, fontWeight: 600 }}>Enter password</h2>
+              </div>
+              <p style={{ color: '#4e5668', fontSize: 12, marginBottom: 24 }}>
+                Signing in as <span style={{ color: '#4f7cff', fontWeight: 600 }}>{username}</span>
+              </p>
+              <form onSubmit={handlePasswordSubmit}>
+                <div style={{ marginBottom: 20 }}>
+                  <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: '#8892a4', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 6 }}>Password</label>
+                  <input
+                    className="inp"
+                    type="password"
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    autoFocus
+                    required
+                    style={{
+                      width: '100%', background: '#13161e', border: '1px solid #2a2f3f',
+                      borderRadius: 7, padding: '10px 12px', color: '#e2e6f0',
+                      fontSize: 13, fontFamily: "'Sora', sans-serif"
+                    }}
+                  />
+                </div>
+                {error && (
+                  <div style={{
+                    background: '#2e0505', border: '1px solid #4f0d0d', borderRadius: 7,
+                    padding: '9px 12px', color: '#ef4444', fontSize: 12, marginBottom: 16
+                  }}>{error}</div>
+                )}
+                <button
+                  className="login-btn"
+                  type="submit"
+                  disabled={loading}
+                  style={{
+                    width: '100%', background: '#4f7cff', border: 'none', borderRadius: 7,
+                    padding: '11px', color: '#fff', fontSize: 13, fontWeight: 600,
+                    fontFamily: "'Sora', sans-serif", cursor: 'pointer', transition: 'background 0.2s'
+                  }}
+                >
+                  {loading ? 'Signing in…' : 'Sign in →'}
+                </button>
+              </form>
+            </>
+          )}
         </div>
 
         <p style={{ textAlign: 'center', marginTop: 20, color: '#4e5668', fontSize: 11 }}>

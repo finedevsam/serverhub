@@ -80,88 +80,153 @@ const StatusDot = ({ status }: { status: string }) => (
   <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%', background:status==='online'?'#22c55e':status==='warn'?'#f59e0b':'#ef4444', flexShrink:0 }} />
 );
 
-function AddServerModal({ onClose, onAdded }: { onClose:()=>void; onAdded:(s:Server)=>void }) {
+function AddServerModal({ onClose, onAdded, twofaEnabled }: { onClose:()=>void; onAdded:(s:Server)=>void; twofaEnabled:boolean }) {
   const [form, setForm] = useState({ name:'', ip:'', port:'22', username:'', auth_type:'key', password:'', private_key:'', tag:'server', use_wireguard:false, wg_config:'' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [step, setStep] = useState<'form'|'totp'>('form');
+  const [totpCode, setTotpCode] = useState('');
+  const [totpError, setTotpError] = useState('');
+  const [totpLoading, setTotpLoading] = useState(false);
   const set = (k: string) => (e: any) => setForm(f => ({ ...f, [k]: e.target.value }));
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault(); setError(''); setLoading(true);
-    try { const res = await serverApi.add({ ...form, port: parseInt(form.port) }); onAdded(res.data); onClose(); }
-    catch (err: any) { setError(err.response?.data?.detail || 'Failed to add server'); }
+
+  const handleFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (twofaEnabled) { setStep('totp'); return; }
+    doSave();
+  };
+
+  const doSave = async () => {
+    setLoading(true); setError('');
+    try {
+      const res = await serverApi.add({ ...form, port: parseInt(form.port) });
+      onAdded(res.data); onClose();
+    }
+    catch (err: any) { setError(err.response?.data?.detail || 'Failed to add server'); setStep('form'); }
     finally { setLoading(false); }
   };
+
+  const handleTotpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault(); setTotpError(''); setTotpLoading(true);
+    try {
+      const r = await auth.stepUp(totpCode);
+      localStorage.setItem('serverhub_stepup_token', r.data.step_up_token);
+      localStorage.setItem('serverhub_stepup_exp', String(Date.now() + r.data.expires_in * 1000));
+      await doSave();
+    } catch (err: any) {
+      setTotpError(err.response?.data?.detail || 'Invalid code');
+      setTotpCode('');
+    } finally {
+      setTotpLoading(false);
+    }
+  };
+
   return (
-    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:200 }} onClick={e=>e.target===e.currentTarget&&step==='form'&&onClose()}>
       <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:480, maxHeight:'90vh', overflowY:'auto' }}>
         <div style={{ padding:'16px 20px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center', position:'sticky', top:0, background:'#13161e', zIndex:1 }}>
-          <span style={{ fontWeight:600, fontSize:14, flex:1 }}>Add server</span>
+          {step === 'totp' && (
+            <button onClick={()=>setStep('form')} style={{ background:'none', border:'none', color:'#4e5668', cursor:'pointer', fontSize:14, marginRight:8, padding:0 }}>←</button>
+          )}
+          <span style={{ fontWeight:600, fontSize:14, flex:1 }}>{step === 'totp' ? 'Confirm with 2FA' : 'Add server'}</span>
           <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
         </div>
-        <form onSubmit={submit} style={{ padding:20 }}>
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
-            <div><Label>Display name</Label><Input value={form.name} onChange={set('name')} placeholder="prod-uk-01" required /></div>
-            <div><Label>Tag</Label>
-              <select value={form.tag} onChange={set('tag')} style={inputStyle}>
-                {['server','prod','staging','api','db','dev'].map(t=><option key={t}>{t}</option>)}
-              </select>
+
+        {/* ── TOTP step ── */}
+        {step === 'totp' && (
+          <form onSubmit={handleTotpSubmit} style={{ padding:24 }}>
+            <div style={{ background:'#0d1433', border:'1px solid #1e2d66', borderRadius:8, padding:'10px 14px', marginBottom:20, fontSize:11, color:'#818cf8' }}>
+              Enter your authenticator code to confirm saving this server configuration.
             </div>
-          </div>
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 100px', gap:12, marginBottom:12 }}>
-            <div><Label>IP / Hostname</Label><Input value={form.ip} onChange={set('ip')} placeholder="10.0.0.1" required /></div>
-            <div><Label>Port</Label><Input value={form.port} onChange={set('port')} type="number" /></div>
-          </div>
-          <div style={{ marginBottom:12 }}><Label>SSH Username</Label><Input value={form.username} onChange={set('username')} placeholder="ubuntu" required /></div>
-          <div style={{ marginBottom:12 }}>
-            <Label>Authentication</Label>
-            <div style={{ display:'flex', gap:6, marginBottom:10 }}>
-              {['key','password'].map(t=>(
-                <button key={t} type="button" onClick={()=>setForm(f=>({...f,auth_type:t}))}
-                  style={{ padding:'5px 14px', borderRadius:6, border:'1px solid', fontSize:11, cursor:'pointer', fontFamily:'inherit',
-                    borderColor:form.auth_type===t?'#4f7cff':'#2a2f3f', background:form.auth_type===t?'#0d1433':'none', color:form.auth_type===t?'#4f7cff':'#8892a4' }}>
-                  {t==='key'?'SSH Key / Certificate':'Password'}
-                </button>
-              ))}
+            <Label>Authenticator code</Label>
+            <input
+              type="text" inputMode="numeric" pattern="[0-9]*" maxLength={6}
+              value={totpCode} onChange={e=>setTotpCode(e.target.value.replace(/\D/g,''))}
+              placeholder="000000" autoFocus required
+              style={{ width:'100%', background:'#1a1e28', border:'1px solid #2a2f3f', borderRadius:7, padding:'12px',
+                color:'#e2e6f0', fontSize:24, fontFamily:"'JetBrains Mono',monospace", letterSpacing:'0.3em',
+                textAlign:'center' as const, outline:'none', marginTop:6, marginBottom: totpError ? 12 : 20 }}
+            />
+            {totpError && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'8px 12px', color:'#ef4444', fontSize:12, marginBottom:16 }}>{totpError}</div>}
+            <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+              <button type="button" onClick={()=>setStep('form')} style={btnGhost}>Back</button>
+              <button type="submit" disabled={totpLoading || totpCode.length < 6}
+                style={{ ...btnPrimary, opacity: totpLoading || totpCode.length < 6 ? 0.6 : 1 }}>
+                {totpLoading ? 'Verifying…' : 'Verify & save'}
+              </button>
             </div>
-            {form.auth_type==='key'?(
-              <>
-                <textarea value={form.private_key} onChange={set('private_key')} placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"} rows={4} style={{ ...inputStyle, fontFamily:"'JetBrains Mono',monospace", fontSize:11, resize:'vertical' as const }} />
-                <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Paste your private key. Encrypted at rest.</p>
-              </>
-            ):(
-              <>
-                <Input value={form.password} onChange={set('password')} type="password" placeholder="SSH password" />
-                <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Password is encrypted at rest.</p>
-              </>
-            )}
-          </div>
-          {/* WireGuard */}
-          <div style={{ marginBottom:12, background:'#0d0f14', border:'1px solid #2a2f3f', borderRadius:8, overflow:'hidden' }}>
-            <div style={{ padding:'10px 14px', display:'flex', alignItems:'center', gap:10, cursor:'pointer' }} onClick={()=>setForm(f=>({...f,use_wireguard:!f.use_wireguard}))}>
-              <div style={{ width:32, height:18, borderRadius:9, background:form.use_wireguard?'#4f7cff':'#2a2f3f', position:'relative', transition:'background 0.2s', flexShrink:0 }}>
-                <div style={{ position:'absolute', top:2, left:form.use_wireguard?14:2, width:14, height:14, borderRadius:'50%', background:'#fff', transition:'left 0.2s' }}/>
-              </div>
-              <div>
-                <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0' }}>WireGuard VPN</div>
-                <div style={{ fontSize:10, color:'#4e5668' }}>Connect through a WireGuard tunnel before SSH</div>
+          </form>
+        )}
+
+        {/* ── Server form step ── */}
+        {step === 'form' && (
+          <form onSubmit={handleFormSubmit} style={{ padding:20 }}>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
+              <div><Label>Display name</Label><Input value={form.name} onChange={set('name')} placeholder="prod-uk-01" required /></div>
+              <div><Label>Tag</Label>
+                <select value={form.tag} onChange={set('tag')} style={inputStyle}>
+                  {['server','prod','staging','api','db','dev'].map(t=><option key={t}>{t}</option>)}
+                </select>
               </div>
             </div>
-            {form.use_wireguard&&(
-              <div style={{ padding:'0 14px 14px' }}>
-                <Label>WireGuard Config</Label>
-                <textarea value={form.wg_config} onChange={set('wg_config')} rows={7}
-                  placeholder={"[Interface]\nPrivateKey = <your-private-key>\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = <server-public-key>\nEndpoint = your-server.com:51820\nAllowedIPs = 10.0.0.0/24"}
-                  style={{ ...inputStyle, fontFamily:"'JetBrains Mono',monospace", fontSize:11, resize:'vertical' as const, width:'100%', boxSizing:'border-box' as const }} />
-                <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Full wg-quick config. Encrypted at rest. WireGuard tunnel will be established before each SSH connection.</p>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 100px', gap:12, marginBottom:12 }}>
+              <div><Label>IP / Hostname</Label><Input value={form.ip} onChange={set('ip')} placeholder="10.0.0.1" required /></div>
+              <div><Label>Port</Label><Input value={form.port} onChange={set('port')} type="number" /></div>
+            </div>
+            <div style={{ marginBottom:12 }}><Label>SSH Username</Label><Input value={form.username} onChange={set('username')} placeholder="ubuntu" required /></div>
+            <div style={{ marginBottom:12 }}>
+              <Label>Authentication</Label>
+              <div style={{ display:'flex', gap:6, marginBottom:10 }}>
+                {['key','password'].map(t=>(
+                  <button key={t} type="button" onClick={()=>setForm(f=>({...f,auth_type:t}))}
+                    style={{ padding:'5px 14px', borderRadius:6, border:'1px solid', fontSize:11, cursor:'pointer', fontFamily:'inherit',
+                      borderColor:form.auth_type===t?'#4f7cff':'#2a2f3f', background:form.auth_type===t?'#0d1433':'none', color:form.auth_type===t?'#4f7cff':'#8892a4' }}>
+                    {t==='key'?'SSH Key / Certificate':'Password'}
+                  </button>
+                ))}
               </div>
-            )}
-          </div>
-          {error&&<div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'8px 12px', color:'#ef4444', fontSize:12, marginBottom:12 }}>{error}</div>}
-          <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
-            <button type="button" onClick={onClose} style={btnGhost}>Cancel</button>
-            <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>{loading?'Connecting…':'Add server'}</button>
-          </div>
-        </form>
+              {form.auth_type==='key'?(
+                <>
+                  <textarea value={form.private_key} onChange={set('private_key')} placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"} rows={4} style={{ ...inputStyle, fontFamily:"'JetBrains Mono',monospace", fontSize:11, resize:'vertical' as const }} />
+                  <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Paste your private key. Encrypted at rest.</p>
+                </>
+              ):(
+                <>
+                  <Input value={form.password} onChange={set('password')} type="password" placeholder="SSH password" />
+                  <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Password is encrypted at rest.</p>
+                </>
+              )}
+            </div>
+            {/* WireGuard */}
+            <div style={{ marginBottom:12, background:'#0d0f14', border:'1px solid #2a2f3f', borderRadius:8, overflow:'hidden' }}>
+              <div style={{ padding:'10px 14px', display:'flex', alignItems:'center', gap:10, cursor:'pointer' }} onClick={()=>setForm(f=>({...f,use_wireguard:!f.use_wireguard}))}>
+                <div style={{ width:32, height:18, borderRadius:9, background:form.use_wireguard?'#4f7cff':'#2a2f3f', position:'relative', transition:'background 0.2s', flexShrink:0 }}>
+                  <div style={{ position:'absolute', top:2, left:form.use_wireguard?14:2, width:14, height:14, borderRadius:'50%', background:'#fff', transition:'left 0.2s' }}/>
+                </div>
+                <div>
+                  <div style={{ fontSize:12, fontWeight:500, color:'#e2e6f0' }}>WireGuard VPN</div>
+                  <div style={{ fontSize:10, color:'#4e5668' }}>Connect through a WireGuard tunnel before SSH</div>
+                </div>
+              </div>
+              {form.use_wireguard&&(
+                <div style={{ padding:'0 14px 14px' }}>
+                  <Label>WireGuard Config</Label>
+                  <textarea value={form.wg_config} onChange={set('wg_config')} rows={7}
+                    placeholder={"[Interface]\nPrivateKey = <your-private-key>\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = <server-public-key>\nEndpoint = your-server.com:51820\nAllowedIPs = 10.0.0.0/24"}
+                    style={{ ...inputStyle, fontFamily:"'JetBrains Mono',monospace", fontSize:11, resize:'vertical' as const, width:'100%', boxSizing:'border-box' as const }} />
+                  <p style={{ fontSize:10, color:'#4e5668', marginTop:4 }}>Full wg-quick config. Encrypted at rest. WireGuard tunnel will be established before each SSH connection.</p>
+                </div>
+              )}
+            </div>
+            {error&&<div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'8px 12px', color:'#ef4444', fontSize:12, marginBottom:12 }}>{error}</div>}
+            <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+              <button type="button" onClick={onClose} style={btnGhost}>Cancel</button>
+              <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>
+                {twofaEnabled ? 'Continue →' : loading ? 'Connecting…' : 'Add server'}
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -220,12 +285,18 @@ function AddUserModal({ onClose, onAdded }: { onClose:()=>void; onAdded:(u:any)=
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const set = (k: string) => (e: any) => setForm(f=>({...f,[k]:e.target.value}));
+
   const submit = async (ev: React.FormEvent<HTMLFormElement>) => {
     ev.preventDefault(); setError(''); setLoading(true);
-    try { const r = await userMgmt.add(form); onAdded(r.data); }
+    try {
+      const r = await userMgmt.add(form);
+      onAdded(r.data);
+      onClose();
+    }
     catch (e: any) { setError(e.response?.data?.detail || 'Failed'); }
     finally { setLoading(false); }
   };
+
   return (
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:300 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:400 }}>
@@ -255,6 +326,191 @@ function AddUserModal({ onClose, onAdded }: { onClose:()=>void; onAdded:(u:any)=
             <button type="submit" disabled={loading} style={{ ...btnPrimary, opacity:loading?0.7:1 }}>{loading?'Creating…':'Add member'}</button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+function QrViewerModal({ username, onClose }: { username: string; onClose: () => void }) {
+  const [qrUrl, setQrUrl] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [resetting, setResetting] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    userMgmt.getQrCode(username)
+      .then(r => setQrUrl(r.data.qr_code_url))
+      .catch(e => setError(e.response?.data?.detail || 'Failed to load QR code'))
+      .finally(() => setLoading(false));
+  }, [username]);
+
+  const handleReset = async () => {
+    if (!confirm(`Reset 2FA for "${username}"? Their current authenticator code will stop working.`)) return;
+    setResetting(true); setError('');
+    try {
+      const r = await userMgmt.reset2fa(username);
+      setQrUrl(r.data.qr_code_url);
+    } catch (e: any) {
+      setError(e.response?.data?.detail || 'Failed to reset 2FA');
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.75)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:300 }} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:380 }}>
+        <div style={{ padding:'14px 18px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center' }}>
+          <span style={{ fontWeight:600, fontSize:14, flex:1 }}>2FA — {username}</span>
+          <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+        <div style={{ padding:24, textAlign:'center' as const }}>
+          {loading && <div style={{ color:'#4e5668', fontSize:12, padding:'20px 0' }}>Loading…</div>}
+          {error && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'9px 12px', color:'#ef4444', fontSize:12, marginBottom:12 }}>{error}</div>}
+          {qrUrl && !loading && (
+            <>
+              <p style={{ color:'#4e5668', fontSize:11, marginBottom:16 }}>
+                Scan with an authenticator app (Google Authenticator, Authy, etc.)
+              </p>
+              <div style={{ background:'#fff', borderRadius:10, padding:12, display:'inline-block', marginBottom:20 }}>
+                <img src={qrUrl} alt="2FA QR Code" style={{ width:180, height:180, display:'block' }} />
+              </div>
+              <div>
+                <button
+                  onClick={handleReset}
+                  disabled={resetting}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:'#f59e0b', borderRadius:6, padding:'6px 14px', fontSize:11, cursor:'pointer', fontFamily:'inherit', opacity:resetting?0.6:1 }}
+                  onMouseOver={e=>{e.currentTarget.style.borderColor='#f59e0b';}}
+                  onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';}}
+                >
+                  {resetting ? 'Resetting…' : 'Reset & regenerate QR code'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Reusable TOTP confirmation modal for destructive / sensitive actions
+function ConfirmWith2FA({ title, message, confirmLabel, onConfirmed, onClose }: {
+  title: string; message: string; confirmLabel: string;
+  onConfirmed: () => Promise<void>; onClose: () => void;
+}) {
+  const [code, setCode] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault(); setError(''); setLoading(true);
+    try {
+      const r = await auth.stepUp(code);
+      localStorage.setItem('serverhub_stepup_token', r.data.step_up_token);
+      localStorage.setItem('serverhub_stepup_exp', String(Date.now() + r.data.expires_in * 1000));
+      await onConfirmed();
+      onClose();
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || err.message || 'Failed';
+      if (detail === '2fa_required' || detail === '2fa_expired' || detail === 'Invalid authenticator code') {
+        setError('Invalid authenticator code');
+        setCode('');
+      } else {
+        setError(detail);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.8)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:500 }}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:360 }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center' }}>
+          <span style={{ fontWeight:600, fontSize:14, flex:1, color:'#e2e6f0' }}>{title}</span>
+          <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+        <div style={{ padding:24 }}>
+          <p style={{ fontSize:12, color:'#4e5668', marginBottom:20, lineHeight:1.6 }}>{message}</p>
+          <form onSubmit={submit}>
+            <Label>Authenticator code</Label>
+            <input
+              type="text" inputMode="numeric" pattern="[0-9]*" maxLength={6}
+              value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,''))}
+              placeholder="000000" autoFocus required
+              style={{ width:'100%', background:'#1a1e28', border:'1px solid #2a2f3f', borderRadius:7,
+                padding:'12px', color:'#e2e6f0', fontSize:24, fontFamily:"'JetBrains Mono',monospace",
+                letterSpacing:'0.3em', textAlign:'center' as const, outline:'none', marginTop:6,
+                marginBottom: error ? 12 : 20 }}
+            />
+            {error && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'8px 12px', color:'#ef4444', fontSize:12, marginBottom:16 }}>{error}</div>}
+            <div style={{ display:'flex', gap:8 }}>
+              <button type="button" onClick={onClose} style={{ ...btnGhost, flex:1 }}>Cancel</button>
+              <button type="submit" disabled={loading || code.length < 6}
+                style={{ ...btnPrimary, flex:1, opacity: loading || code.length < 6 ? 0.6 : 1,
+                  background:'#ef4444' }}>
+                {loading ? 'Verifying…' : confirmLabel}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TotpModal({ onVerified, onClose }: { onVerified:()=>void; onClose:()=>void }) {
+  const [code, setCode] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault(); setError(''); setLoading(true);
+    try {
+      const r = await auth.stepUp(code);
+      localStorage.setItem('serverhub_stepup_token', r.data.step_up_token);
+      localStorage.setItem('serverhub_stepup_exp', String(Date.now() + r.data.expires_in * 1000));
+      onVerified();
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Invalid code');
+      setCode('');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.8)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:400 }}>
+      <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:360 }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid #2a2f3f', display:'flex', alignItems:'center' }}>
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:600, fontSize:14, color:'#e2e6f0' }}>Two-factor verification</div>
+            <div style={{ fontSize:11, color:'#4e5668', marginTop:2 }}>Required to access servers</div>
+          </div>
+          <button onClick={onClose} style={{ background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:18 }}>✕</button>
+        </div>
+        <div style={{ padding:24 }}>
+          <div style={{ background:'#0d1433', border:'1px solid #1e2d66', borderRadius:8, padding:'10px 14px', marginBottom:20, fontSize:11, color:'#818cf8' }}>
+            Open your authenticator app and enter the 6-digit code to unlock server access for 15 minutes.
+          </div>
+          <form onSubmit={submit}>
+            <Label>Authenticator code</Label>
+            <input
+              type="text" inputMode="numeric" pattern="[0-9]*" maxLength={6}
+              value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,''))}
+              placeholder="000000" autoFocus required
+              style={{ width:'100%', background:'#1a1e28', border:'1px solid #2a2f3f', borderRadius:7, padding:'12px',
+                color:'#e2e6f0', fontSize:24, fontFamily:"'JetBrains Mono',monospace", letterSpacing:'0.3em',
+                textAlign:'center' as const, outline:'none', marginTop:6, marginBottom:error?12:20 }}
+            />
+            {error && <div style={{ background:'#2e0505', border:'1px solid #4f0d0d', borderRadius:6, padding:'8px 12px', color:'#ef4444', fontSize:12, marginBottom:16 }}>{error}</div>}
+            <button type="submit" disabled={loading||code.length<6}
+              style={{ ...btnPrimary, width:'100%', padding:'11px', opacity:loading||code.length<6?0.6:1 }}>
+              {loading?'Verifying…':'Verify & connect'}
+            </button>
+          </form>
+        </div>
       </div>
     </div>
   );
@@ -384,7 +640,7 @@ function OverviewTab({ server, onRunCmd }: { server: Server; onRunCmd:(cmd:strin
     {label:'📋 System log',cmd:'sudo journalctl -n 30 --no-pager'},
   ];
   if(loading) return <div style={{ padding:24, color:'#4e5668' }}>Loading metrics…</div>;
-  if(err) return <div style={{ padding:24, color:'#ef4444', fontSize:12 }}>⚠ {err}<br/><span style={{color:'#4e5668',fontSize:11}}>python3 must be installed on the target server.</span></div>;
+  if(err) return <div style={{ padding:24, color:'#ef4444', fontSize:12 }}>⚠ {err}</div>;
   return (
     <div style={{ flex:1, overflowY:'auto', padding:'16px 20px', display:'flex', flexDirection:'column', gap:14 }}>
       <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
@@ -878,9 +1134,11 @@ function HomeDashboard({ servers, onOpen, onAdd, isAdmin }: { servers: Server[];
 }
 
 // ─── Servers table view ────────────────────────────────────────────────
-function ServersTable({ servers, onOpen, onDelete, onAdd, isAdmin }: { servers:Server[]; onOpen:(s:Server)=>void; onDelete:(id:string)=>void; onAdd:()=>void; isAdmin:boolean }) {
+function ServersTable({ servers, onOpen, onDelete, onAdd, isAdmin }: { servers:Server[]; onOpen:(s:Server)=>void; onDelete:(id:string)=>Promise<void>; onAdd:()=>void; isAdmin:boolean }) {
   const cols = isAdmin ? '28px 1fr 160px 60px 80px 70px 80px 80px 110px' : '28px 1fr 160px 60px 80px 70px 80px 80px 70px';
+  const [confirmDelete, setConfirmDelete] = useState<Server|null>(null);
   return (
+    <>
     <div style={{ flex:1, overflowY:'auto', padding:'24px 28px' }}>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
         <div>
@@ -926,7 +1184,7 @@ function ServersTable({ servers, onOpen, onDelete, onAdd, isAdmin }: { servers:S
             <div style={{ display:'flex', gap:6, alignItems:'center' }} onClick={e=>e.stopPropagation()}>
               <button onClick={() => onOpen(s)} style={{ ...btnPrimary, padding:'3px 10px', fontSize:10 }}>Connect</button>
               {isAdmin && (
-                <button onClick={() => onDelete(s.id)}
+                <button onClick={() => setConfirmDelete(s)}
                   style={{ background:'none', border:'1px solid #2a2f3f', color:'#4e5668', borderRadius:5, padding:'3px 7px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
                   onMouseOver={e=>{ e.currentTarget.style.borderColor='#4f0d0d'; e.currentTarget.style.color='#ef4444'; }}
                   onMouseOut={e=>{ e.currentTarget.style.borderColor='#2a2f3f'; e.currentTarget.style.color='#4e5668'; }}>Delete</button>
@@ -936,6 +1194,16 @@ function ServersTable({ servers, onOpen, onDelete, onAdd, isAdmin }: { servers:S
         ))}
       </div>
     </div>
+    {confirmDelete && (
+      <ConfirmWith2FA
+        title="Delete server"
+        message={`Enter your authenticator code to permanently delete "${confirmDelete.name}" (${confirmDelete.ip}:${confirmDelete.port}).`}
+        confirmLabel="Delete server"
+        onConfirmed={async () => { onDelete(confirmDelete.id); }}
+        onClose={() => setConfirmDelete(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -964,7 +1232,10 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [managingAccess, setManagingAccess] = useState<string|null>(null);
+  const [viewingQr, setViewingQr] = useState<string|null>(null);
   const [accessRefreshKey, setAccessRefreshKey] = useState(0);
+  const [toggling2fa, setToggling2fa] = useState<string|null>(null);
+  const [confirmDeleteUser, setConfirmDeleteUser] = useState<string|null>(null);
 
   const load = useCallback(async () => {
     try { const r = await userMgmt.list(); setUsers(r.data); }
@@ -974,9 +1245,8 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
   useEffect(()=>{ load(); },[load]);
 
   const handleDelete = async (username: string) => {
-    if (!confirm(`Remove "${username}" from the team?`)) return;
-    try { await userMgmt.delete(username); setUsers(p=>p.filter(u=>u.username!==username)); }
-    catch (e: any) { alert(e.response?.data?.detail||'Failed'); }
+    await userMgmt.delete(username);
+    setUsers(p=>p.filter(u=>u.username!==username));
   };
 
   const handleRoleChange = async (username: string, role: string) => {
@@ -984,16 +1254,35 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
     catch (e: any) { alert(e.response?.data?.detail||'Failed'); }
   };
 
+  const handleToggle2fa = async (username: string, currentlyEnabled: boolean) => {
+    if (currentlyEnabled) {
+      if (!confirm(`Disable 2FA for "${username}"? They will no longer need a code to access servers.`)) return;
+    }
+    setToggling2fa(username);
+    try {
+      if (currentlyEnabled) {
+        await userMgmt.deactivate2fa(username);
+        setUsers(p=>p.map(u=>u.username===username?{...u,twofa_enabled:false}:u));
+      } else {
+        await userMgmt.activate2fa(username);
+        setUsers(p=>p.map(u=>u.username===username?{...u,twofa_enabled:true}:u));
+        // Show QR code immediately after activation
+        setViewingQr(username);
+      }
+    } catch (e: any) { alert(e.response?.data?.detail||'Failed'); }
+    finally { setToggling2fa(null); }
+  };
+
   if (loading) return <div style={{ padding:24, color:'#4e5668', fontSize:12 }}>Loading…</div>;
 
-  const COLS = '1fr 160px 140px 140px 120px';
+  const COLS = '1fr 160px 120px 100px 100px 160px';
 
   return (
     <div style={{ flex:1, overflowY:'auto', padding:'24px 28px' }}>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
         <div>
           <div style={{ fontSize:15, fontWeight:600, color:'#e2e6f0' }}>Team</div>
-          <div style={{ fontSize:11, color:'#4e5668', marginTop:2 }}>{users.length} member{users.length!==1?'s':''} · manage roles and server access</div>
+          <div style={{ fontSize:11, color:'#4e5668', marginTop:2 }}>{users.length} member{users.length!==1?'s':''} · manage roles, server access and 2FA</div>
         </div>
         {isAdmin && (
           <button onClick={()=>setShowAdd(true)} style={{ ...btnPrimary, display:'flex', alignItems:'center', gap:6 }}>
@@ -1003,7 +1292,7 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
         )}
       </div>
 
-      {/* Role legend */}
+      {/* Legend */}
       <div style={{ display:'flex', gap:10, marginBottom:16 }}>
         {[{role:'admin',color:'#818cf8',bg:'#0d1433',bdr:'#1e2d66',desc:'Full access to all servers, users & settings'},
           {role:'developer',color:'#22c55e',bg:'#052e1a',bdr:'#0d4f2a',desc:'Can only access servers explicitly granted by admin'}].map(r=>(
@@ -1015,9 +1304,8 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
       </div>
 
       <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:10, overflow:'hidden' }}>
-        {/* Table header */}
         <div style={{ display:'grid', gridTemplateColumns:COLS, padding:'8px 16px', borderBottom:'1px solid #2a2f3f', background:'#0d0f14' }}>
-          {['Member','Role','Server access','Added','Actions'].map((h,i)=>(
+          {['Member','Role','Server access','Added','2FA','Actions'].map((h,i)=>(
             <div key={i} style={{ fontSize:10, fontWeight:600, color:'#4e5668', textTransform:'uppercase' as const, letterSpacing:'0.06em' }}>{h}</div>
           ))}
         </div>
@@ -1052,7 +1340,7 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
               )}
             </div>
 
-            {/* Server access summary */}
+            {/* Server access */}
             <div>
               {u.role === 'admin' ? (
                 <span style={{ fontSize:10, color:'#818cf8', background:'#0d1433', border:'1px solid #1e2d66', borderRadius:6, padding:'2px 8px' }}>All servers</span>
@@ -1064,8 +1352,18 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
             {/* Added */}
             <div style={{ fontSize:11, color:'#4e5668' }}>{u.created_at?new Date(u.created_at).toLocaleDateString():'—'}</div>
 
+            {/* 2FA status */}
+            <div>
+              <span style={{ fontSize:10, fontWeight:600, padding:'2px 8px', borderRadius:6,
+                background:u.twofa_enabled?'#052e1a':'#1a1e28',
+                border:`1px solid ${u.twofa_enabled?'#0d4f2a':'#2a2f3f'}`,
+                color:u.twofa_enabled?'#22c55e':'#4e5668' }}>
+                {u.twofa_enabled ? 'ON' : 'OFF'}
+              </span>
+            </div>
+
             {/* Actions */}
-            <div style={{ display:'flex', gap:6 }}>
+            <div style={{ display:'flex', gap:5, flexWrap:'wrap' as const }}>
               {isAdmin && u.role !== 'admin' && (
                 <button onClick={()=>setManagingAccess(u.username)}
                   style={{ background:'none', border:'1px solid #2a2f3f', color:'#4f7cff', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
@@ -1074,8 +1372,26 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
                   Access
                 </button>
               )}
+              {isAdmin && (
+                <button
+                  onClick={()=>handleToggle2fa(u.username, u.twofa_enabled)}
+                  disabled={toggling2fa===u.username}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:u.twofa_enabled?'#f59e0b':'#22c55e', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit', opacity:toggling2fa===u.username?0.5:1 }}
+                  onMouseOver={e=>{e.currentTarget.style.borderColor=u.twofa_enabled?'#f59e0b':'#22c55e';}}
+                  onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';}}>
+                  {toggling2fa===u.username ? '…' : u.twofa_enabled ? 'Disable 2FA' : 'Enable 2FA'}
+                </button>
+              )}
+              {isAdmin && u.twofa_enabled && (
+                <button onClick={()=>setViewingQr(u.username)}
+                  style={{ background:'none', border:'1px solid #2a2f3f', color:'#818cf8', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
+                  onMouseOver={e=>{e.currentTarget.style.borderColor='#818cf8';}}
+                  onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';}}>
+                  QR
+                </button>
+              )}
               {isAdmin && u.username!==currentUser && (
-                <button onClick={()=>handleDelete(u.username)}
+                <button onClick={()=>setConfirmDeleteUser(u.username)}
                   style={{ background:'none', border:'1px solid #2a2f3f', color:'#4e5668', borderRadius:5, padding:'3px 8px', fontSize:10, cursor:'pointer', fontFamily:'inherit' }}
                   onMouseOver={e=>{e.currentTarget.style.borderColor='#4f0d0d';e.currentTarget.style.color='#ef4444';}}
                   onMouseOut={e=>{e.currentTarget.style.borderColor='#2a2f3f';e.currentTarget.style.color='#4e5668';}}>
@@ -1095,6 +1411,16 @@ function TeamPage({ currentUser, isAdmin, allServers }: { currentUser:string; is
           onClose={(saved)=>{ setManagingAccess(null); if(saved) setAccessRefreshKey(k=>k+1); }}
         />
       )}
+      {viewingQr && <QrViewerModal username={viewingQr} onClose={()=>setViewingQr(null)} />}
+      {confirmDeleteUser && (
+        <ConfirmWith2FA
+          title="Remove team member"
+          message={`Enter your authenticator code to permanently remove "${confirmDeleteUser}" from the team.`}
+          confirmLabel="Remove member"
+          onConfirmed={() => handleDelete(confirmDeleteUser)}
+          onClose={() => setConfirmDeleteUser(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1104,11 +1430,15 @@ export default function Dashboard() {
   const router = useRouter();
   const [user, setUser] = useState('');
   const [role, setRole] = useState('developer');
+  const [twofaEnabled, setTwofaEnabled] = useState(false);
   const [serverList, setServerList] = useState<Server[]>([]);
   const [activeTopTab, setActiveTopTab] = useState<'dashboard'|'servers'|'team'|string>('dashboard');
   const [openConnections, setOpenConnections] = useState<string[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showChangePwd, setShowChangePwd] = useState(false);
+  const [showTotpModal, setShowTotpModal] = useState(false);
+  const [show2faBlocked, setShow2faBlocked] = useState(false);
+  const [pendingServer, setPendingServer] = useState<Server|null>(null);
 
   const isAdmin = role === 'admin';
 
@@ -1116,42 +1446,77 @@ export default function Dashboard() {
     const token = localStorage.getItem('serverhub_token');
     if (!token) { router.push('/login'); return; }
     auth.me()
-      .then(r => { setUser(r.data.username); setRole(r.data.role ?? 'developer'); })
+      .then(r => {
+        setUser(r.data.username);
+        setRole(r.data.role ?? 'developer');
+        setTwofaEnabled(r.data.twofa_enabled ?? false);
+      })
       .catch(() => { localStorage.removeItem('serverhub_token'); router.push('/login'); });
     loadServers();
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Listen for 2FA events fired by the axios interceptor
+  useEffect(() => {
+    const onRequired = () => { setShowTotpModal(true); };
+    const onNotSetup = () => { setShow2faBlocked(true); };
+    window.addEventListener('serverhub:2fa_required', onRequired);
+    window.addEventListener('serverhub:2fa_not_setup', onNotSetup);
+    return () => {
+      window.removeEventListener('serverhub:2fa_required', onRequired);
+      window.removeEventListener('serverhub:2fa_not_setup', onNotSetup);
+    };
   }, []);
 
   const loadServers = async () => {
     try { const r = await serverApi.list(); setServerList(r.data); } catch {}
   };
 
-  const openConnection = (s: Server) => {
+  const doOpenConnection = (s: Server) => {
     if (!openConnections.includes(s.id)) setOpenConnections(p => [...p, s.id]);
     setActiveTopTab(s.id);
   };
 
+  const openConnection = (s: Server) => {
+    if (!twofaEnabled) {
+      setShow2faBlocked(true);
+      return;
+    }
+    setPendingServer(s);
+    setShowTotpModal(true);
+  };
+
+  const handleTotpVerified = () => {
+    setShowTotpModal(false);
+    if (pendingServer) {
+      doOpenConnection(pendingServer);
+      setPendingServer(null);
+    }
+  };
+
   const closeConnection = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setOpenConnections(p => p.filter(x => x !== id));
+    const remaining = openConnections.filter(x => x !== id);
+    setOpenConnections(remaining);
     if (activeTopTab === id) setActiveTopTab('servers');
+    // Clear step-up token so re-opening requires 2FA again
+    if (remaining.length === 0) {
+      localStorage.removeItem('serverhub_stepup_token');
+      localStorage.removeItem('serverhub_stepup_exp');
+    }
   };
 
   const handleLogout = () => { localStorage.removeItem('serverhub_token'); router.push('/login'); };
 
   const handleServerAdded = (s: Server) => {
     setServerList(p => [...p, s]);
-    openConnection(s);
   };
 
   const handleDeleteServer = async (id: string) => {
-    if (!confirm('Remove this server?')) return;
-    try {
-      await serverApi.delete(id);
-      setServerList(p => p.filter(s => s.id !== id));
-      setOpenConnections(p => p.filter(x => x !== id));
-      if (activeTopTab === id) setActiveTopTab('servers');
-    } catch (e: any) { alert(e.response?.data?.detail || 'Failed'); }
+    await serverApi.delete(id);
+    setServerList(p => p.filter(s => s.id !== id));
+    setOpenConnections(p => p.filter(x => x !== id));
+    if (activeTopTab === id) setActiveTopTab('servers');
   };
 
   const online = serverList.filter(s => s.status === 'online').length;
@@ -1254,8 +1619,22 @@ export default function Dashboard() {
         })}
       </div>
 
-      {showAddModal   && <AddServerModal      onClose={()=>setShowAddModal(false)}  onAdded={handleServerAdded}/>}
+      {showAddModal   && <AddServerModal      onClose={()=>setShowAddModal(false)}  onAdded={handleServerAdded} twofaEnabled={twofaEnabled}/>}
       {showChangePwd  && <ChangePasswordModal onClose={()=>setShowChangePwd(false)}/>}
+      {showTotpModal  && <TotpModal onVerified={handleTotpVerified} onClose={()=>{ setShowTotpModal(false); setPendingServer(null); }}/>}
+      {show2faBlocked && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.8)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:400 }}>
+          <div style={{ background:'#13161e', border:'1px solid #2a2f3f', borderRadius:12, width:360, padding:28, textAlign:'center' as const }}>
+            <div style={{ width:44, height:44, borderRadius:'50%', background:'#2e0505', border:'1px solid #4f0d0d', display:'flex', alignItems:'center', justifyContent:'center', margin:'0 auto 16px', fontSize:20 }}>🔒</div>
+            <div style={{ fontSize:14, fontWeight:600, color:'#e2e6f0', marginBottom:8 }}>2FA not enabled</div>
+            <p style={{ fontSize:12, color:'#4e5668', marginBottom:20, lineHeight:1.6 }}>
+              Your account requires two-factor authentication to access servers.<br/>
+              Ask your admin to enable 2FA on your account.
+            </p>
+            <button onClick={()=>setShow2faBlocked(false)} style={{ ...btnPrimary, width:'100%' }}>OK</button>
+          </div>
+        </div>
+      )}
 
       {/* ── Footer ──────────────────────────────────── */}
       <div style={{ height:28, background:'#13161e', borderTop:'1px solid #1a1e28', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>

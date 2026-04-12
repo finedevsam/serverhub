@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -18,12 +18,13 @@ import tempfile
 import base64
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from twofa.auth import TwoFa
 from contextlib import asynccontextmanager
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-app = FastAPI(title="ServerHub API", version="1.0.0")
+app = FastAPI(title=f"{os.getenv('APP_NAME', 'ServerHub')} API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,6 +37,8 @@ app.add_middleware(
 security = HTTPBearer()
 
 # ─────────────────────── Config ───────────────────────
+APP_NAME = os.getenv("APP_NAME", "ServerHub")
+
 JWT_SECRET = os.getenv("JWT_SECRET", "serverhub-super-secret-change-in-prod")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 12
@@ -47,6 +50,15 @@ SERVERS_FILE   = "/data/servers.json"
 DB_FILE        = "/data/serverhub.db"
 SSH_KEYS_DIR   = "/data/ssh_keys"
 WG_CONFIGS_DIR = "/data/wg_configs"
+
+# ─────────────────────── 2FA storage config ───────────────────────
+TWOFA_STORAGE                 = os.getenv("TWOFA_STORAGE", "")
+TWOFA_S3_BUCKET               = os.getenv("TWOFA_S3_BUCKET", "")
+TWOFA_S3_ACCESS_KEY           = os.getenv("TWOFA_S3_ACCESS_KEY", "")
+TWOFA_S3_SECRET_ACCESS        = os.getenv("TWOFA_S3_SECRET_ACCESS", "")
+TWOFA_CLOUDINARY_CLOUD_NAME   = os.getenv("TWOFA_CLOUDINARY_CLOUD_NAME", "")
+TWOFA_CLOUDINARY_API_KEY      = os.getenv("TWOFA_CLOUDINARY_API_KEY", "")
+TWOFA_CLOUDINARY_API_SECRET   = os.getenv("TWOFA_CLOUDINARY_API_SECRET", "")
 
 os.makedirs("/data", exist_ok=True)
 os.makedirs(SSH_KEYS_DIR, exist_ok=True)
@@ -97,6 +109,12 @@ class UserCreate(BaseModel):
     password: str
     role: str = "developer"   # "admin" | "developer"
 
+class StepUpRequest(BaseModel):
+    code: str
+
+class PreflightRequest(BaseModel):
+    username: str
+
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -142,11 +160,14 @@ def init_db():
     try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                username    TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                role        TEXT NOT NULL DEFAULT 'developer',
-                created_at  TEXT NOT NULL,
-                created_by  TEXT
+                username      TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL DEFAULT '',
+                role          TEXT NOT NULL DEFAULT 'developer',
+                created_at    TEXT NOT NULL,
+                created_by    TEXT,
+                twofa_key     TEXT,
+                twofa_qr_url  TEXT,
+                twofa_enabled INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS permissions (
                 username  TEXT NOT NULL,
@@ -154,6 +175,16 @@ def init_db():
                 PRIMARY KEY (username, server_id)
             );
         """)
+        # Migrate existing DB — add columns if they don't exist yet
+        for col_def in ("twofa_key TEXT", "twofa_qr_url TEXT", "twofa_enabled INTEGER DEFAULT 0"):
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # Migrate: mark any existing users who already have a twofa_key as enabled
+        conn.execute(
+            "UPDATE users SET twofa_enabled = 1 WHERE twofa_key IS NOT NULL AND twofa_key != '' AND twofa_enabled = 0"
+        )
         # Bootstrap admin from env if table is empty
         cur = conn.execute("SELECT COUNT(*) FROM users")
         if cur.fetchone()[0] == 0:
@@ -166,6 +197,48 @@ def init_db():
         conn.close()
 
 init_db()
+
+# ─────────────────────── 2FA helpers ───────────────────────
+def _twofa_client() -> TwoFa:
+    return TwoFa(issuer_name=APP_NAME)
+
+def setup_user_2fa(identifier: str) -> dict:
+    """Generate a QR code via the twofa library. Returns {user_key, qr_url}."""
+    if not TWOFA_STORAGE:
+        raise HTTPException(
+            status_code=500,
+            detail="2FA storage is not configured. Set TWOFA_STORAGE (and matching credentials) in .env"
+        )
+    if TWOFA_STORAGE not in ("s3bucket", "cloudinary"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unknown TWOFA_STORAGE value '{TWOFA_STORAGE}'. Use 's3bucket' or 'cloudinary'"
+        )
+    client = _twofa_client()
+    if TWOFA_STORAGE == "s3bucket":
+        result = client.generate_qr_code(
+            identifier=identifier,
+            storage="s3bucket",
+            bucket_name=TWOFA_S3_BUCKET,
+            access_key=TWOFA_S3_ACCESS_KEY,
+            secret_access=TWOFA_S3_SECRET_ACCESS,
+        )
+    else:
+        result = client.generate_qr_code(
+            identifier=identifier,
+            storage="cloudinary",
+            cloud_name=TWOFA_CLOUDINARY_CLOUD_NAME,
+            api_key=TWOFA_CLOUDINARY_API_KEY,
+            api_secret=TWOFA_CLOUDINARY_API_SECRET,
+        )
+    if not result.get("status"):
+        raise HTTPException(status_code=500, detail=f"Failed to generate 2FA QR code: {result.get('message', '')}")
+    return {"user_key": result["user_key"], "qr_url": result["url"]}
+
+def verify_user_2fa(user_key: str, code: str) -> bool:
+    """Validate a TOTP code against the stored user_key."""
+    result = _twofa_client().validate_code(user_key=user_key, code=code)
+    return result.get("status") is True and result.get("message") == "valid"
 
 
 def assert_server_access(server_id: str, username: str):
@@ -217,12 +290,80 @@ def require_admin(username: str = Depends(verify_token)) -> str:
         conn.close()
     return username
 
+# ─────────────────────── Step-up (2FA gate for server access) ───────────────────────
+STEP_UP_SECRET = JWT_SECRET + "_stepup_v1"
+STEP_UP_EXPIRE_MINUTES = 15
+
+def create_step_up_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "type": "step_up",
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=STEP_UP_EXPIRE_MINUTES),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, STEP_UP_SECRET, algorithm=JWT_ALGORITHM)
+
+def require_admin_and_2fa(request: Request, user: str = Depends(require_admin)) -> str:
+    """Admin-only endpoints that always require a valid step-up 2FA token."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT twofa_enabled FROM users WHERE username = ?", (user,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["twofa_enabled"]:
+        raise HTTPException(status_code=403, detail="2fa_not_setup")
+    step_up_token = request.headers.get("x-step-up-token", "")
+    if not step_up_token:
+        raise HTTPException(status_code=403, detail="2fa_required")
+    try:
+        payload = jwt.decode(step_up_token, STEP_UP_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("sub") != user or payload.get("type") != "step_up":
+            raise HTTPException(status_code=403, detail="Invalid step-up token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=403, detail="2fa_expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=403, detail="Invalid step-up token")
+    return user
+
+def require_2fa_if_enabled(request: Request, user: str = Depends(verify_token)) -> str:
+    """Server access always requires 2FA. If not set up, block entirely. If set up, require a valid step-up token."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT role, twofa_enabled FROM users WHERE username = ?", (user,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=403, detail="User not found")
+    # 2FA must be enabled for everyone (including admins)
+    if not row["twofa_enabled"]:
+        raise HTTPException(status_code=403, detail="2fa_not_setup")
+    # 2FA is enabled — require a valid step-up token
+    step_up_token = request.headers.get("x-step-up-token", "")
+    if not step_up_token:
+        raise HTTPException(status_code=403, detail="2fa_required")
+    try:
+        payload = jwt.decode(step_up_token, STEP_UP_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("sub") != user or payload.get("type") != "step_up":
+            raise HTTPException(status_code=403, detail="Invalid step-up token")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=403, detail="2fa_expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=403, detail="Invalid step-up token")
+    return user
+
 # ─────────────────────── WireGuard helpers ───────────────────────
 def wg_iface(server_id: str) -> str:
     return f"wg-sh-{server_id[:8]}"
 
 def wg_up(server_id: str) -> None:
-    """Bring up a WireGuard interface for this server."""
+    """Bring up a WireGuard interface for this server (no-op if already up)."""
+    iface = wg_iface(server_id)
+    # If the interface already exists, skip setup entirely — this makes
+    # subsequent connections to the same server near-instant.
+    check = subprocess.run(["ip", "link", "show", iface], capture_output=True, timeout=3)
+    if check.returncode == 0:
+        return  # already up
+
     wg_enc = get_wg_path(server_id)
     if not os.path.exists(wg_enc):
         raise HTTPException(status_code=400, detail="WireGuard config not found")
@@ -233,7 +374,6 @@ def wg_up(server_id: str) -> None:
         line for line in config.splitlines()
         if not line.strip().upper().startswith("DNS")
     )
-    iface = wg_iface(server_id)
     tmp = f"/tmp/{iface}.conf"
     with open(tmp, "w") as f:
         f.write(config + "\n")
@@ -243,22 +383,18 @@ def wg_up(server_id: str) -> None:
         os.unlink(tmp)
         raise HTTPException(status_code=500, detail=f"WireGuard up failed: {result.stderr.strip()}")
 
-    # Wait for the WireGuard peer handshake before we attempt SSH.
-    # wg-quick returns as soon as the interface is up, but the crypto handshake
-    # with the peer (and therefore actual traffic flow) takes a moment longer.
-    deadline = time.monotonic() + 8  # wait at most 8 s
+    # Wait for the peer handshake — poll quickly so we don't over-wait.
+    deadline = time.monotonic() + 5  # wait at most 5 s
     while time.monotonic() < deadline:
         show = subprocess.run(
             ["wg", "show", iface, "latest-handshakes"],
             capture_output=True, text=True, timeout=5,
         )
-        # Output is "peer_pubkey  <unix_timestamp>"; a non-zero timestamp means
-        # the handshake completed.
         for line in show.stdout.splitlines():
             parts = line.split()
             if len(parts) == 2 and parts[1] != "0":
                 return  # handshake confirmed
-        time.sleep(0.5)
+        time.sleep(0.2)
 
 def wg_down(server_id: str) -> None:
     iface = wg_iface(server_id)
@@ -312,11 +448,9 @@ def get_ssh_client(server_data: dict) -> paramiko.SSHClient:
 
 def run_ssh_command(server_data: dict, command: str, timeout: int = 30) -> dict:
     client = None
-    wg_active = False
     try:
         if server_data.get("use_wireguard"):
             wg_up(server_data["id"])
-            wg_active = True
         client = get_ssh_client(server_data)
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         out = stdout.read().decode("utf-8", errors="replace")
@@ -332,8 +466,6 @@ def run_ssh_command(server_data: dict, command: str, timeout: int = 30) -> dict:
     finally:
         if client:
             client.close()
-        if wg_active:
-            wg_down(server_data["id"])
 
 def check_server_status(server_data: dict) -> str:
     try:
@@ -344,29 +476,53 @@ def check_server_status(server_data: dict) -> str:
 
 # ─────────────────────── Routes ───────────────────────
 
+@app.post("/api/auth/preflight")
+def auth_preflight(req: PreflightRequest):
+    """Return the auth type for a username so the UI can show the right input."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT twofa_key FROM users WHERE username = ?", (req.username,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        # Don't reveal whether user exists — just say password
+        return {"auth_type": "password"}
+    return {"auth_type": "totp" if row["twofa_key"] else "password"}
+
 @app.post("/api/auth/login")
 def login(req: LoginRequest):
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT password_hash, role FROM users WHERE username = ?", (req.username,)
+            "SELECT password_hash, role, twofa_enabled FROM users WHERE username = ?", (req.username,)
         ).fetchone()
     finally:
         conn.close()
-    if not row or row["password_hash"] != hash_password(req.password):
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not row["password_hash"]:
+        raise HTTPException(status_code=401, detail="Account has no password. Ask your admin to reset it.")
+    if row["password_hash"] != hash_password(req.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(req.username)
-    return {"token": token, "username": req.username, "role": row["role"], "expires_in": JWT_EXPIRE_HOURS * 3600}
+    return {
+        "token": token,
+        "username": req.username,
+        "role": row["role"],
+        "twofa_enabled": bool(row["twofa_enabled"]),
+        "expires_in": JWT_EXPIRE_HOURS * 3600,
+    }
 
 @app.get("/api/auth/me")
 def me(user: str = Depends(verify_token)):
     conn = get_db()
     try:
-        row = conn.execute("SELECT role FROM users WHERE username = ?", (user,)).fetchone()
+        row = conn.execute("SELECT role, twofa_enabled FROM users WHERE username = ?", (user,)).fetchone()
         role = row["role"] if row else "developer"
+        twofa_enabled = bool(row["twofa_enabled"]) if row else False
     finally:
         conn.close()
-    return {"username": user, "role": role}
+    return {"username": user, "role": role, "twofa_enabled": twofa_enabled}
 
 @app.post("/api/auth/change-password")
 def change_password(req: ChangePasswordRequest, user: str = Depends(verify_token)):
@@ -391,8 +547,17 @@ def change_password(req: ChangePasswordRequest, user: str = Depends(verify_token
 def list_users(admin: str = Depends(require_admin)):
     conn = get_db()
     try:
-        rows = conn.execute("SELECT username, role, created_at FROM users").fetchall()
-        return [{"username": r["username"], "role": r["role"], "created_at": r["created_at"] or ""} for r in rows]
+        rows = conn.execute("SELECT username, role, created_at, twofa_enabled, password_hash FROM users").fetchall()
+        return [
+            {
+                "username": r["username"],
+                "role": r["role"],
+                "created_at": r["created_at"] or "",
+                "twofa_enabled": bool(r["twofa_enabled"]),
+                "has_password": bool(r["password_hash"]),
+            }
+            for r in rows
+        ]
     finally:
         conn.close()
 
@@ -415,10 +580,62 @@ def create_user(req: UserCreate, admin: str = Depends(require_admin)):
         conn.commit()
     finally:
         conn.close()
-    return {"username": req.username, "role": req.role, "created_at": created_at}
+    return {"username": req.username, "role": req.role, "created_at": created_at, "twofa_enabled": False, "has_password": True}
+
+@app.post("/api/auth/step-up")
+def step_up_auth(req: StepUpRequest, user: str = Depends(verify_token)):
+    """Verify a TOTP code and return a short-lived step-up token for server access."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT twofa_key, twofa_enabled FROM users WHERE username = ?", (user,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not row["twofa_enabled"] or not row["twofa_key"]:
+            raise HTTPException(status_code=400, detail="2FA is not enabled for your account")
+        if not verify_user_2fa(user_key=row["twofa_key"], code=req.code):
+            raise HTTPException(status_code=400, detail="Invalid authenticator code")
+    finally:
+        conn.close()
+    token = create_step_up_token(user)
+    return {"step_up_token": token, "expires_in": STEP_UP_EXPIRE_MINUTES * 60}
+
+@app.post("/api/users/{username}/activate-2fa")
+def activate_user_2fa(username: str, admin: str = Depends(require_admin)):
+    """Generate a TOTP QR code for a user and enable 2FA server-access gate."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        twofa = setup_user_2fa(username)
+        conn.execute(
+            "UPDATE users SET twofa_key = ?, twofa_qr_url = ?, twofa_enabled = 1 WHERE username = ?",
+            (twofa["user_key"], twofa["qr_url"], username),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"username": username, "twofa_enabled": True, "qr_code_url": twofa["qr_url"]}
+
+@app.post("/api/users/{username}/deactivate-2fa")
+def deactivate_user_2fa(username: str, admin: str = Depends(require_admin)):
+    """Disable 2FA server-access gate for a user."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        conn.execute(
+            "UPDATE users SET twofa_key = NULL, twofa_qr_url = NULL, twofa_enabled = 0 WHERE username = ?",
+            (username,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"username": username, "twofa_enabled": False}
 
 @app.delete("/api/users/{username}")
-def delete_user(username: str, admin: str = Depends(require_admin)):
+def delete_user(username: str, admin: str = Depends(require_admin_and_2fa)):
     if username == admin:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
     conn = get_db()
@@ -500,8 +717,12 @@ def list_servers(user: str = Depends(verify_token)):
     return [{k: v for k, v in s.items() if k != "password"} for s in visible]
 
 @app.post("/api/servers")
-def add_server(req: ServerCreate, user: str = Depends(require_admin)):
+def add_server(req: ServerCreate, user: str = Depends(require_admin_and_2fa)):
     servers = load_servers()
+    # Duplicate check — same IP + port
+    for s in servers.values():
+        if s.get("ip") == req.ip and s.get("port") == req.port:
+            raise HTTPException(status_code=409, detail=f"A server at {req.ip}:{req.port} already exists ({s['name']})")
     server_id = hashlib.md5(f"{req.ip}:{req.port}:{req.name}:{time.time()}".encode()).hexdigest()[:12]
 
     server_data = {
@@ -541,12 +762,13 @@ def add_server(req: ServerCreate, user: str = Depends(require_admin)):
     return {k: v for k, v in servers[server_id].items() if k != "password"}
 
 @app.delete("/api/servers/{server_id}")
-def delete_server(server_id: str, user: str = Depends(require_admin)):
+def delete_server(server_id: str, user: str = Depends(require_admin_and_2fa)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
     del servers[server_id]
     save_servers(servers)
+    wg_down(server_id)  # bring down tunnel if running
     for path_fn in (get_key_path, get_wg_path):
         p = path_fn(server_id)
         if os.path.exists(p):
@@ -554,7 +776,7 @@ def delete_server(server_id: str, user: str = Depends(require_admin)):
     return {"message": "Server deleted"}
 
 @app.get("/api/servers/{server_id}/status")
-def server_status(server_id: str, user: str = Depends(verify_token)):
+def server_status(server_id: str, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -566,61 +788,64 @@ def server_status(server_id: str, user: str = Depends(verify_token)):
 
 # ─── Metrics ───
 @app.get("/api/servers/{server_id}/metrics")
-def get_metrics(server_id: str, user: str = Depends(verify_token)):
+def get_metrics(server_id: str, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
     assert_server_access(server_id, user)
     s = servers[server_id]
 
-    script = """
-python3 -c "
-import subprocess, json, os, time
+    # Pure shell — no Python required on the remote server
+    script = r"""
+set -e
+# CPU: sample /proc/stat twice with a 0.5s sleep using only shell + awk
+read _ c1 c2 c3 c4 c5 c6 c7 _ < /proc/stat
+sleep 0.5
+read _ d1 d2 d3 d4 d5 d6 d7 _ < /proc/stat
+cpu=$(awk "BEGIN{
+  idle1=$c4; total1=$c1+$c2+$c3+$c4+$c5+$c6+$c7;
+  idle2=$d4; total2=$d1+$d2+$d3+$d4+$d5+$d6+$d7;
+  dtotal=total2-total1; didle=idle2-idle1;
+  if(dtotal>0) printf \"%.1f\", 100*(1-didle/dtotal); else print \"0.0\"
+}")
 
-# CPU
-cpu_lines = open('/proc/stat').readlines()[0].split()
-cpu = list(map(int, cpu_lines[1:]))
-idle1 = cpu[3]
-total1 = sum(cpu)
-time.sleep(0.5)
-cpu_lines = open('/proc/stat').readlines()[0].split()
-cpu = list(map(int, cpu_lines[1:]))
-idle2 = cpu[3]
-total2 = sum(cpu)
-cpu_pct = round(100 * (1 - (idle2-idle1)/(total2-total1)), 1)
+# Memory from /proc/meminfo (values in kB)
+mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+mem_used=$((mem_total - mem_avail))
+mem_pct=$(awk "BEGIN{printf \"%.1f\", 100*$mem_used/$mem_total}")
+mem_used_mb=$(awk "BEGIN{printf \"%.1f\", $mem_used/1024}")
+mem_total_mb=$(awk "BEGIN{printf \"%.1f\", $mem_total/1024}")
 
-# Memory
-mem = {}
-for l in open('/proc/meminfo'):
-    k, v = l.split(':')
-    mem[k.strip()] = int(v.strip().split()[0])
-mem_total = mem['MemTotal']
-mem_free = mem['MemAvailable']
-mem_used = mem_total - mem_free
-mem_pct = round(100 * mem_used / mem_total, 1)
+# Disk via df (no Python shutil needed)
+disk_info=$(df / | awk 'NR==2{print $2,$3,$5}')
+disk_total_kb=$(echo $disk_info | awk '{print $1}')
+disk_used_kb=$(echo $disk_info | awk '{print $2}')
+disk_pct=$(echo $disk_info | awk '{gsub(/%/,"",$3); print $3}')
+disk_used_gb=$(awk "BEGIN{printf \"%.1f\", $disk_used_kb/1024/1024}")
+disk_total_gb=$(awk "BEGIN{printf \"%.1f\", $disk_total_kb/1024/1024}")
 
-# Disk
-import shutil
-disk = shutil.disk_usage('/')
-disk_pct = round(100 * disk.used / disk.total, 1)
-disk_used_gb = round(disk.used / 1024**3, 1)
-disk_total_gb = round(disk.total / 1024**3, 1)
+# Uptime from /proc/uptime
+uptime_secs=$(awk '{print int($1)}' /proc/uptime)
+uptime_days=$((uptime_secs/86400))
+uptime_hours=$(( (uptime_secs%86400)/3600 ))
 
-# Uptime
-uptime_secs = float(open('/proc/uptime').read().split()[0])
-days = int(uptime_secs // 86400)
-hours = int((uptime_secs % 86400) // 3600)
+# Network — sum all relevant interfaces
+net_rx=0; net_tx=0
+while read line; do
+  iface=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+  case "$iface" in eth*|ens*|enp*|wlan*|bond*|em*)
+    rx=$(echo "$line" | awk '{print $2}')
+    tx=$(echo "$line" | awk '{print $10}')
+    net_rx=$((net_rx+rx)); net_tx=$((net_tx+tx))
+  esac
+done < /proc/net/dev
+net_rx_mb=$(awk "BEGIN{printf \"%.1f\", $net_rx/1048576}")
+net_tx_mb=$(awk "BEGIN{printf \"%.1f\", $net_tx/1048576}")
 
-# Network
-net_lines = open('/proc/net/dev').readlines()
-rx=tx=0
-for l in net_lines[2:]:
-    parts = l.split()
-    if parts[0].startswith(('eth','ens','enp','wlan','bond')):
-        rx += int(parts[1]); tx += int(parts[9])
-
-print(json.dumps({'cpu':cpu_pct,'mem_pct':mem_pct,'mem_used_mb':round(mem_used/1024,1),'mem_total_mb':round(mem_total/1024,1),'disk_pct':disk_pct,'disk_used_gb':disk_used_gb,'disk_total_gb':disk_total_gb,'uptime':f'{days}d {hours}h','net_rx_mb':round(rx/1024/1024,1),'net_tx_mb':round(tx/1024/1024,1)}))
-"
+printf '{"cpu":%s,"mem_pct":%s,"mem_used_mb":%s,"mem_total_mb":%s,"disk_pct":%s,"disk_used_gb":%s,"disk_total_gb":%s,"uptime":"%dd %dh","net_rx_mb":%s,"net_tx_mb":%s}\n' \
+  $cpu $mem_pct $mem_used_mb $mem_total_mb $disk_pct $disk_used_gb $disk_total_gb \
+  $uptime_days $uptime_hours $net_rx_mb $net_tx_mb
 """
     result = run_ssh_command(s, script, timeout=15)
     try:
@@ -630,7 +855,7 @@ print(json.dumps({'cpu':cpu_pct,'mem_pct':mem_pct,'mem_used_mb':round(mem_used/1
 
 # ─── Commands ───
 @app.post("/api/servers/{server_id}/exec")
-def exec_command(server_id: str, req: CommandRequest, user: str = Depends(verify_token)):
+def exec_command(server_id: str, req: CommandRequest, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -644,7 +869,7 @@ def exec_command(server_id: str, req: CommandRequest, user: str = Depends(verify
 
 # ─── Services ───
 @app.get("/api/servers/{server_id}/services")
-def get_services(server_id: str, user: str = Depends(verify_token)):
+def get_services(server_id: str, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -663,7 +888,7 @@ def get_services(server_id: str, user: str = Depends(verify_token)):
     return services
 
 @app.post("/api/servers/{server_id}/services/{service}/action")
-def service_action(server_id: str, service: str, action: str, user: str = Depends(verify_token)):
+def service_action(server_id: str, service: str, action: str, user: str = Depends(require_2fa_if_enabled)):
     if action not in ("start", "stop", "restart", "status"):
         raise HTTPException(status_code=400, detail="Invalid action")
     servers = load_servers()
@@ -675,7 +900,7 @@ def service_action(server_id: str, service: str, action: str, user: str = Depend
 
 # ─── Docker ───
 @app.get("/api/servers/{server_id}/docker")
-def get_docker(server_id: str, user: str = Depends(verify_token)):
+def get_docker(server_id: str, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -692,7 +917,7 @@ def get_docker(server_id: str, user: str = Depends(verify_token)):
     return containers
 
 @app.post("/api/servers/{server_id}/docker/{container}/action")
-def docker_action(server_id: str, container: str, action: str, user: str = Depends(verify_token)):
+def docker_action(server_id: str, container: str, action: str, user: str = Depends(require_2fa_if_enabled)):
     if action not in ("start", "stop", "restart", "logs"):
         raise HTTPException(status_code=400, detail="Invalid action")
     servers = load_servers()
@@ -705,7 +930,7 @@ def docker_action(server_id: str, container: str, action: str, user: str = Depen
 
 # ─── Files ───
 @app.get("/api/servers/{server_id}/files")
-def list_files(server_id: str, path: str = "/", user: str = Depends(verify_token)):
+def list_files(server_id: str, path: str = "/", user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -714,7 +939,7 @@ def list_files(server_id: str, path: str = "/", user: str = Depends(verify_token
     return {"path": path, "output": result["stdout"]}
 
 @app.get("/api/servers/{server_id}/file-content")
-def read_file(server_id: str, path: str, user: str = Depends(verify_token)):
+def read_file(server_id: str, path: str, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -727,7 +952,7 @@ async def upload_file(
     server_id: str,
     remote_path: str = Form(...),
     file: UploadFile = File(...),
-    user: str = Depends(verify_token),
+    user: str = Depends(require_2fa_if_enabled),
 ):
     servers = load_servers()
     if server_id not in servers:
@@ -735,12 +960,10 @@ async def upload_file(
     assert_server_access(server_id, user)
     server_data = servers[server_id]
     data = await file.read()
-    wg_active = False
     ssh_client = None
     try:
         if server_data.get("use_wireguard"):
             wg_up(server_id)
-            wg_active = True
         ssh_client = get_ssh_client(server_data)
         sftp = ssh_client.open_sftp()
         dest = remote_path.rstrip("/") + "/" + file.filename if remote_path.endswith("/") else remote_path
@@ -755,12 +978,10 @@ async def upload_file(
     finally:
         if ssh_client:
             ssh_client.close()
-        if wg_active:
-            wg_down(server_id)
 
 # ─── Logs ───
 @app.get("/api/servers/{server_id}/logs")
-def get_logs(server_id: str, service: str = "syslog", lines: int = 100, user: str = Depends(verify_token)):
+def get_logs(server_id: str, service: str = "syslog", lines: int = 100, user: str = Depends(require_2fa_if_enabled)):
     servers = load_servers()
     if server_id not in servers:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -771,6 +992,39 @@ def get_logs(server_id: str, service: str = "syslog", lines: int = 100, user: st
         cmd = f"sudo journalctl -u {service} -n {lines} --no-pager 2>/dev/null"
     result = run_ssh_command(servers[server_id], cmd, timeout=15)
     return {"logs": result["stdout"]}
+
+# ─── 2FA management (admin only) ───
+@app.get("/api/users/{username}/qrcode")
+def get_user_qrcode(username: str, admin: str = Depends(require_admin)):
+    """Return the stored QR code URL for a user."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT twofa_qr_url FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        if not row["twofa_qr_url"]:
+            raise HTTPException(status_code=404, detail="No QR code found for this user")
+        return {"qr_code_url": row["twofa_qr_url"]}
+    finally:
+        conn.close()
+
+@app.post("/api/users/{username}/reset-2fa")
+def reset_user_2fa(username: str, admin: str = Depends(require_admin)):
+    """Regenerate a new 2FA QR code for a user (invalidates the old one)."""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        twofa = setup_user_2fa(username)
+        conn.execute(
+            "UPDATE users SET twofa_key = ?, twofa_qr_url = ? WHERE username = ?",
+            (twofa["user_key"], twofa["qr_url"], username),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"username": username, "qr_code_url": twofa["qr_url"]}
 
 # ─── Server access management (admin only) ───
 @app.get("/api/users/{username}/servers")
@@ -818,8 +1072,13 @@ def health():
 
 # ─── WebSocket PTY Terminal ───
 @app.websocket("/ws/servers/{server_id}/terminal")
-async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(...)):
-    # Verify token
+async def terminal_ws(
+    websocket: WebSocket,
+    server_id: str,
+    token: str = Query(...),
+    step_up_token: Optional[str] = Query(None),
+):
+    # Verify main JWT
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
@@ -831,12 +1090,31 @@ async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(.
         await websocket.close(code=4004)
         return
 
-    # Check access for non-admin users
     username = payload["sub"]
     conn = get_db()
     try:
-        u_row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
-        if not u_row or u_row["role"] != "admin":
+        u_row = conn.execute("SELECT role, twofa_enabled FROM users WHERE username = ?", (username,)).fetchone()
+        if not u_row:
+            await websocket.close(code=4001)
+            return
+        # Check 2FA step-up if enabled
+        if u_row["twofa_enabled"]:
+            if not step_up_token:
+                await websocket.close(code=4003)
+                conn.close()
+                return
+            try:
+                su_payload = jwt.decode(step_up_token, STEP_UP_SECRET, algorithms=[JWT_ALGORITHM])
+                if su_payload.get("sub") != username or su_payload.get("type") != "step_up":
+                    await websocket.close(code=4003)
+                    conn.close()
+                    return
+            except jwt.PyJWTError:
+                await websocket.close(code=4003)
+                conn.close()
+                return
+        # Check server access for non-admin users
+        if u_row["role"] != "admin":
             p_row = conn.execute(
                 "SELECT 1 FROM permissions WHERE username = ? AND server_id = ?", (username, server_id)
             ).fetchone()
@@ -852,13 +1130,11 @@ async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(.
     server_data = servers[server_id]
     ssh_client = None
     channel = None
-    wg_active = False
     stop_event = threading.Event()
 
     try:
         if server_data.get("use_wireguard"):
             wg_up(server_id)
-            wg_active = True
 
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -947,5 +1223,3 @@ async def terminal_ws(websocket: WebSocket, server_id: str, token: str = Query(.
             channel.close()
         if ssh_client:
             ssh_client.close()
-        if wg_active:
-            wg_down(server_id)

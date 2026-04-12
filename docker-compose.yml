@@ -8,9 +8,17 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - APP_NAME=${APP_NAME:-ServerHub}
       - JWT_SECRET=${JWT_SECRET:-serverhub-change-this-secret-in-production}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - TWOFA_STORAGE=${TWOFA_STORAGE:-}
+      - TWOFA_S3_BUCKET=${TWOFA_S3_BUCKET:-}
+      - TWOFA_S3_ACCESS_KEY=${TWOFA_S3_ACCESS_KEY:-}
+      - TWOFA_S3_SECRET_ACCESS=${TWOFA_S3_SECRET_ACCESS:-}
+      - TWOFA_CLOUDINARY_CLOUD_NAME=${TWOFA_CLOUDINARY_CLOUD_NAME:-}
+      - TWOFA_CLOUDINARY_API_KEY=${TWOFA_CLOUDINARY_API_KEY:-}
+      - TWOFA_CLOUDINARY_API_SECRET=${TWOFA_CLOUDINARY_API_SECRET:-}
     volumes:
       - serverhub_data:/data
     networks:

@@ -8,6 +8,8 @@ api.interceptors.request.use((config) => {
   if (typeof window !== 'undefined') {
     const token = localStorage.getItem('serverhub_token');
     if (token) config.headers.Authorization = `Bearer ${token}`;
+    const stepUpToken = localStorage.getItem('serverhub_stepup_token');
+    if (stepUpToken) config.headers['X-Step-Up-Token'] = stepUpToken;
   }
   return config;
 });
@@ -18,6 +20,16 @@ api.interceptors.response.use(
     if (err.response?.status === 401 && typeof window !== 'undefined') {
       localStorage.removeItem('serverhub_token');
       window.location.href = '/login';
+    }
+    if (err.response?.status === 403 && typeof window !== 'undefined') {
+      const detail = err.response?.data?.detail;
+      if (detail === '2fa_required' || detail === '2fa_expired') {
+        localStorage.removeItem('serverhub_stepup_token');
+        localStorage.removeItem('serverhub_stepup_exp');
+        window.dispatchEvent(new CustomEvent('serverhub:2fa_required'));
+      } else if (detail === '2fa_not_setup') {
+        window.dispatchEvent(new CustomEvent('serverhub:2fa_not_setup'));
+      }
     }
     return Promise.reject(err);
   }
@@ -31,6 +43,8 @@ export const auth = {
   me: () => api.get('/api/auth/me'),
   changePassword: (current_password: string, new_password: string) =>
     api.post('/api/auth/change-password', { current_password, new_password }),
+  stepUp: (code: string) =>
+    api.post('/api/auth/step-up', { code }),
 };
 
 export const userMgmt = {
@@ -44,6 +58,14 @@ export const userMgmt = {
     api.get(`/api/users/${username}/servers`),
   setUserServers: (username: string, server_ids: string[]) =>
     api.put(`/api/users/${username}/servers`, { server_ids }),
+  activate2fa: (username: string) =>
+    api.post(`/api/users/${username}/activate-2fa`),
+  deactivate2fa: (username: string) =>
+    api.post(`/api/users/${username}/deactivate-2fa`),
+  getQrCode: (username: string) =>
+    api.get(`/api/users/${username}/qrcode`),
+  reset2fa: (username: string) =>
+    api.post(`/api/users/${username}/reset-2fa`),
 };
 
 export const dashboardStats = {

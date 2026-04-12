@@ -37,7 +37,8 @@ export default function TerminalTab({ server, isActive, onReady }: Props) {
 
     const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
     const wsBase = apiBase.replace(/^http/, 'ws');
-    const wsUrl = `${wsBase}/ws/servers/${server.id}/terminal?token=${encodeURIComponent(token)}`;
+    const stepUpToken = typeof window !== 'undefined' ? localStorage.getItem('serverhub_stepup_token') : null;
+    const wsUrl = `${wsBase}/ws/servers/${server.id}/terminal?token=${encodeURIComponent(token)}${stepUpToken ? `&step_up_token=${encodeURIComponent(stepUpToken)}` : ''}`;
 
     const term = new Terminal({
       theme: {
@@ -165,7 +166,8 @@ export default function TerminalTab({ server, isActive, onReady }: Props) {
 
     const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
     const wsBase = apiBase.replace(/^http/, 'ws');
-    const wsUrl = `${wsBase}/ws/servers/${server.id}/terminal?token=${encodeURIComponent(token)}`;
+    const stepUpToken = typeof window !== 'undefined' ? localStorage.getItem('serverhub_stepup_token') : null;
+    const wsUrl = `${wsBase}/ws/servers/${server.id}/terminal?token=${encodeURIComponent(token)}${stepUpToken ? `&step_up_token=${encodeURIComponent(stepUpToken)}` : ''}`;
 
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
